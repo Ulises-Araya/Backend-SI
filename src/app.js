@@ -1,0 +1,361 @@
+const express = require('express');
+const cors = require('cors');
+const morgan = require('morgan');
+const { randomUUID } = require('crypto');
+const TrafficController = require('./trafficController');
+const { persistTrafficEvent } = require('./persistence/trafficEventsRepository');
+
+const MAX_MESSAGES = Number(process.env.MAX_MESSAGES || 500);
+
+const messages = [];
+const trafficController = new TrafficController();
+const sseClients = new Set();
+const TICK_INTERVAL_MS = Number(process.env.TICK_INTERVAL_MS ?? 250) || 250;
+
+const trafficTickTimer = setInterval(() => {
+  const transitions = trafficController.tick();
+  if (Array.isArray(transitions) && transitions.length) {
+    console.debug('[traffic] transitions', transitions);
+  }
+}, TICK_INTERVAL_MS);
+
+if (typeof trafficTickTimer.unref === 'function') {
+  trafficTickTimer.unref();
+}
+
+const app = express();
+
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('dev'));
+
+function keepLatestMessages() {
+  if (messages.length > MAX_MESSAGES) {
+    messages.splice(0, messages.length - MAX_MESSAGES);
+  }
+}
+
+function broadcast(event, payload) {
+  const data = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const client of sseClients) {
+    client.write(data);
+  }
+}
+
+trafficController.on('state', (state) => {
+  broadcast('traffic-state', state);
+});
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', storedMessages: messages.length });
+});
+
+app.get('/api/traffic/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  res.write(`retry: 3000\n`);
+  res.write(`event: traffic-state\ndata: ${JSON.stringify(trafficController.getState())}\n\n`);
+  res.write(`event: messages\ndata: ${JSON.stringify({ total: messages.length, data: messages.slice().reverse() })}\n\n`);
+
+  sseClients.add(res);
+
+  req.on('close', () => {
+    sseClients.delete(res);
+    res.end();
+  });
+});
+
+app.get('/', (_req, res) => {
+  const trafficState = trafficController.getState();
+  const trafficCards = trafficState.lanes
+    .map((lane) => `
+      <article class="lane lane--${lane.state}" data-lane="${lane.id}">
+        <h3>${lane.id.toUpperCase()}</h3>
+        <p><strong>Estado:</strong> <span data-field="state">${lane.state}</span></p>
+        <p><strong>Último cambio:</strong> <span data-field="lastChangeAt">${lane.lastChangeAt ? new Date(lane.lastChangeAt).toLocaleTimeString() : '—'}</span></p>
+        <p><strong>Último vehículo:</strong> <span data-field="lastVehicleAt">${lane.lastVehicleAt ? new Date(lane.lastVehicleAt).toLocaleTimeString() : '—'}</span></p>
+        <p><strong>Distancia:</strong> <span data-field="distance">${Number.isFinite(lane.lastDistanceCm) ? lane.lastDistanceCm : '—'}</span> cm</p>
+        <p><strong>En cola:</strong> <span data-field="queue">${lane.waiting ? 'Sí' : 'No'}</span></p>
+      </article>
+    `)
+    .join('');
+
+  const listItems = messages
+    .slice()
+    .reverse()
+    .map((msg) => `
+      <li>
+        <div><strong>${new Date(msg.receivedAt).toLocaleTimeString()}</strong> — <em>${msg.deviceId || 'unknown-device'}</em></div>
+        <pre>${JSON.stringify(msg.payload, null, 2)}</pre>
+      </li>
+    `)
+    .join('');
+
+  res.type('html').send(`
+    <!doctype html>
+    <html lang="es">
+      <head>
+        <meta charset="utf-8" />
+        <title>Semáforo inteligente</title>
+        <style>
+          :root { color-scheme: light dark; }
+          body { font-family: "Segoe UI", Arial, sans-serif; margin: 2rem; background: #f8fafc; color: #0f172a; }
+          h1, h2 { color: #0f172a; }
+          ul { list-style: none; padding: 0; }
+          li { background: #fff; margin-bottom: 1rem; padding: 1rem; border-radius: 12px; box-shadow: 0 4px 16px rgba(15, 23, 42, 0.12); }
+          pre { background: #0f172a; color: #f8fafc; padding: 0.75rem; border-radius: 8px; overflow-x: auto; }
+          header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 2rem; }
+          .lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
+          .lane { background: #fff; padding: 1.5rem; border-radius: 16px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.12); border: 3px solid transparent; transition: transform 0.2s ease, box-shadow 0.2s ease; }
+          .lane:hover { transform: translateY(-4px); box-shadow: 0 16px 40px rgba(15, 23, 42, 0.18); }
+          .lane--green { border-color: #16a34a; }
+          .lane--yellow { border-color: #eab308; }
+          .lane--red { border-color: #dc2626; }
+          .badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.9rem; border-radius: 999px; background: #e2e8f0; color: #0f172a; font-size: 0.9rem; font-weight: 500; }
+          .badge span { font-weight: 600; }
+          .placeholder { color: #64748b; }
+        </style>
+      </head>
+      <body>
+        <header>
+          <h1>Estado del semáforo inteligente</h1>
+          <p class="badge">Cola actual: <span id="queue-badge">${trafficState.queue.length ? trafficState.queue.join(', ') : 'Vacía'}</span></p>
+        </header>
+
+        <section class="lanes" id="lanes">
+          ${trafficCards}
+        </section>
+
+        <h2>Mensajes recibidos (<span id="messages-count">${messages.length}</span>)</h2>
+        <p>Usa <code>POST /api/messages</code> o <code>POST /api/traffic/events</code> para enviar datos desde tu ESP32.</p>
+        <ul id="messages-list">
+          ${listItems || '<li class="placeholder">No hay mensajes recibidos todavía.</li>'}
+        </ul>
+
+        <script>
+          (function () {
+            const formatTime = (value) => {
+              if (!value && value !== 0) return '—';
+              const date = new Date(value);
+              return Number.isNaN(date.getTime()) ? '—' : date.toLocaleTimeString();
+            };
+
+            const formatDistance = (value) => {
+              return Number.isFinite(value) ? value.toFixed(2) : '—';
+            };
+
+            const lanesContainer = document.getElementById('lanes');
+            const queueBadge = document.getElementById('queue-badge');
+            const messagesCount = document.getElementById('messages-count');
+            const messagesList = document.getElementById('messages-list');
+
+            const updateLaneCard = (lane) => {
+              const article = lanesContainer.querySelector('[data-lane="' + lane.id + '"]');
+              if (!article) return;
+
+              article.classList.remove('lane--green', 'lane--yellow', 'lane--red');
+              article.classList.add('lane--' + lane.state);
+
+              const setField = (name, value) => {
+                const el = article.querySelector('[data-field="' + name + '"]');
+                if (el) {
+                  el.textContent = value;
+                }
+              };
+
+              setField('state', lane.state);
+              setField('lastChangeAt', formatTime(lane.lastChangeAt));
+              setField('lastVehicleAt', formatTime(lane.lastVehicleAt));
+              setField('distance', formatDistance(lane.lastDistanceCm));
+              setField('queue', lane.waiting ? 'Sí' : 'No');
+            };
+
+            const updateMessages = (payload) => {
+              messagesCount.textContent = payload.total;
+              messagesList.innerHTML = '';
+
+              if (!payload.total) {
+                const li = document.createElement('li');
+                li.className = 'placeholder';
+                li.textContent = 'No hay mensajes recibidos todavía.';
+                messagesList.appendChild(li);
+                return;
+              }
+
+              payload.data.forEach((msg) => {
+                const li = document.createElement('li');
+                const header = document.createElement('div');
+                const strong = document.createElement('strong');
+                strong.textContent = formatTime(msg.receivedAt);
+                const em = document.createElement('em');
+                em.textContent = msg.deviceId || 'unknown-device';
+                header.appendChild(strong);
+                header.appendChild(document.createTextNode(' — '));
+                header.appendChild(em);
+
+                const pre = document.createElement('pre');
+                pre.textContent = JSON.stringify(msg.payload, null, 2);
+
+                li.appendChild(header);
+                li.appendChild(pre);
+                messagesList.appendChild(li);
+              });
+            };
+
+            const refresh = async () => {
+              try {
+                const [trafficRes, messagesRes] = await Promise.all([
+                  fetch('/api/traffic/lights', { cache: 'no-store' }),
+                  fetch('/api/messages', { cache: 'no-store' }),
+                ]);
+
+                if (!trafficRes.ok || !messagesRes.ok) {
+                  throw new Error('Respuesta HTTP inválida');
+                }
+
+                const traffic = await trafficRes.json();
+                const messagesPayload = await messagesRes.json();
+
+                queueBadge.textContent = traffic.queue.length ? traffic.queue.join(', ') : 'Vacía';
+                traffic.lanes.forEach(updateLaneCard);
+                updateMessages(messagesPayload);
+              } catch (error) {
+                console.error('Error actualizando tablero', error);
+              }
+            };
+
+            refresh();
+            setInterval(refresh, 2000);
+          })();
+        </script>
+      </body>
+    </html>
+  `);
+});
+
+app.get('/api/messages', (_req, res) => {
+  res.json({
+    total: messages.length,
+    data: messages.slice().reverse(),
+  });
+});
+
+app.get('/api/messages/latest', (_req, res) => {
+  if (!messages.length) {
+    res.status(204).send();
+    return;
+  }
+
+  res.json(messages[messages.length - 1]);
+});
+
+app.post('/api/messages', (req, res) => {
+  if (!req.body || Object.keys(req.body).length === 0) {
+    res.status(400).json({ message: 'Se requiere un cuerpo JSON con datos.' });
+    return;
+  }
+
+  const { deviceId } = req.body;
+
+  const entry = {
+    id: randomUUID(),
+    deviceId: typeof deviceId === 'string' ? deviceId : null,
+    payload: req.body,
+    ip: req.ip,
+    receivedAt: new Date().toISOString(),
+  };
+
+  messages.push(entry);
+  keepLatestMessages();
+  broadcast('messages', {
+    total: messages.length,
+    data: messages.slice().reverse(),
+  });
+
+  res.status(201).json({ message: 'Mensaje recibido', data: entry });
+});
+
+app.post('/api/traffic/events', async (req, res) => {
+  const { deviceId, sensors, intersectionId, timestamp } = req.body || {};
+
+  if (!deviceId || typeof sensors !== 'object' || sensors === null) {
+    res.status(400).json({ message: 'Se requieren los campos deviceId y sensors.' });
+    return;
+  }
+
+  try {
+    const result = trafficController.ingestEvent({
+      deviceId,
+      intersectionId,
+      sensors,
+      timestamp: Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now(),
+    });
+
+    const receivedAt = new Date().toISOString();
+    const entry = {
+      id: randomUUID(),
+      type: 'traffic-event',
+      deviceId,
+      payload: req.body,
+      stateSnapshot: result.state,
+      ip: req.ip,
+      receivedAt,
+    };
+
+    messages.push(entry);
+    keepLatestMessages();
+
+    const persistenceResult = await persistTrafficEvent({
+      id: entry.id,
+      deviceId,
+      intersectionId,
+      sensors,
+      stateSnapshot: result.state,
+      evaluation: result.evaluation,
+      ip: req.ip,
+      receivedAt,
+    });
+
+    if (persistenceResult?.error) {
+      console.error('[supabase] No se pudo persistir un evento de tráfico.');
+    }
+
+    res.status(201).json({
+      message: 'Evento procesado',
+      state: result.state,
+      evaluation: result.evaluation,
+      persistence: persistenceResult ?? { skipped: true },
+    });
+
+    broadcast('messages', {
+      total: messages.length,
+      data: messages.slice().reverse(),
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+});
+
+app.get('/api/traffic/lights', (_req, res) => {
+  res.json(trafficController.getState());
+});
+
+app.get('/api/traffic/lights/:laneId', (req, res) => {
+  const laneState = trafficController.getLaneState(req.params.laneId);
+  if (!laneState) {
+    res.status(404).json({ message: `Semáforo ${req.params.laneId} no encontrado` });
+    return;
+  }
+
+  res.json(laneState);
+});
+
+app.use((err, _req, res, _next) => {
+  console.error('Unexpected error:', err);
+  res.status(500).json({ message: 'Error interno del servidor' });
+});
+
+module.exports = { app, messages, trafficController };
