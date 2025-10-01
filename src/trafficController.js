@@ -133,8 +133,11 @@ class TrafficController extends EventEmitter {
           laneState.isOccupied ||
           sinceLastVehicle <= this.config.vehiclePresenceGraceMs ||
           (Number.isFinite(clearedAgo) && clearedAgo <= this.config.holdAfterClearMs);
+        const hadVehicleThisCycle =
+          laneState.lastVehicleAt !== null && laneState.lastVehicleAt >= laneState.lastChangeAt;
+        const canIgnoreMinGreen = hadVehicleThisCycle && !holdDueToVehicle;
 
-        if (elapsed < this.config.minGreenMs) {
+        if (elapsed < this.config.minGreenMs && !canIgnoreMinGreen) {
           break;
         }
 

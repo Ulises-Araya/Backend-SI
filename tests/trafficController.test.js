@@ -148,6 +148,42 @@ describe('TrafficController', () => {
     expect(state.lanes.find((lane) => lane.id === 'north').state).not.toBe('green');
   });
 
+  test('ignores remaining minGreen once last vehicle cleared', () => {
+    const controller = new TrafficController({
+      ...baseConfig,
+      minGreenMs: 3_000,
+      maxGreenMs: 6_000,
+      yellowMs: 200,
+      holdAfterClearMs: 200,
+      detectionThresholdCm: 30,
+      vehiclePresenceGraceMs: 400,
+    });
+
+    const start = Date.now();
+    controller.reset(start);
+
+    controller.ingestEvent({
+      deviceId: 'esp32',
+      sensors: { sensor1: 12 },
+      timestamp: start + 100,
+      processedAt: start + 100,
+    });
+
+    controller.ingestEvent({
+      deviceId: 'esp32',
+      sensors: { sensor1: 999 },
+      timestamp: start + 900,
+      processedAt: start + 900,
+    });
+
+    controller.tick(start + 1_050);
+    expect(controller.getState().lanes.find((lane) => lane.id === 'north').state).toBe('green');
+
+    controller.tick(start + 1_150);
+    const state = controller.getState();
+    expect(state.lanes.find((lane) => lane.id === 'north').state).toBe('yellow');
+  });
+
   test('removes lane from queue when sensor clears before turning green', () => {
     const controller = new TrafficController(baseConfig);
     const now = Date.now();
