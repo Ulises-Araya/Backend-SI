@@ -219,6 +219,9 @@ app.post('/api/traffic/events', async (req, res) => {
 });
 
 app.get('/api/traffic/lights', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   res.json(trafficController.getState());
 });
 
