@@ -1,9 +1,8 @@
 const request = require('supertest');
-const { app, messages, trafficController } = require('../src/app');
+const { app, trafficController } = require('../src/app');
 
 describe('Traffic routes', () => {
   beforeEach(() => {
-    messages.length = 0;
     trafficController.reset();
   });
 
@@ -30,9 +29,7 @@ describe('Traffic routes', () => {
 
     expect(response.status).toBe(201);
     expect(response.body.state.queue).toContain('west');
-    expect(messages.length).toBe(1);
-    expect(messages[0].type).toBe('traffic-event');
-    expect(messages[0].stateSnapshot.lanes).toBeDefined();
+    expect(response.body.evaluation).toBeInstanceOf(Array);
   });
 
   test('retrieves state for whole intersection and individual lane', async () => {

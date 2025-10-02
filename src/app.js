@@ -5,9 +5,6 @@ const { randomUUID } = require('crypto');
 const TrafficController = require('./trafficController');
 const { persistTrafficEvent } = require('./persistence/trafficEventsRepository');
 
-const MAX_MESSAGES = Number(process.env.MAX_MESSAGES || 500);
-
-const messages = [];
 const trafficController = new TrafficController();
 const sseClients = new Set();
 const TICK_INTERVAL_MS = Number(process.env.TICK_INTERVAL_MS ?? 250) || 250;
@@ -29,12 +26,6 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
-function keepLatestMessages() {
-  if (messages.length > MAX_MESSAGES) {
-    messages.splice(0, messages.length - MAX_MESSAGES);
-  }
-}
-
 function broadcast(event, payload) {
   const data = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const client of sseClients) {
@@ -47,7 +38,8 @@ trafficController.on('state', (state) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', storedMessages: messages.length });
+  const currentState = trafficController.getState();
+  res.json({ status: 'ok', lanes: currentState.lanes.length, queue: currentState.queue.length });
 });
 
 app.get('/api/traffic/stream', (req, res) => {
@@ -58,7 +50,6 @@ app.get('/api/traffic/stream', (req, res) => {
 
   res.write(`retry: 3000\n`);
   res.write(`event: traffic-state\ndata: ${JSON.stringify(trafficController.getState())}\n\n`);
-  res.write(`event: messages\ndata: ${JSON.stringify({ total: messages.length, data: messages.slice().reverse() })}\n\n`);
 
   sseClients.add(res);
 
@@ -80,17 +71,6 @@ app.get('/', (_req, res) => {
         <p><strong>Distancia:</strong> <span data-field="distance">${Number.isFinite(lane.lastDistanceCm) ? lane.lastDistanceCm : '—'}</span> cm</p>
         <p><strong>En cola:</strong> <span data-field="queue">${lane.waiting ? 'Sí' : 'No'}</span></p>
       </article>
-    `)
-    .join('');
-
-  const listItems = messages
-    .slice()
-    .reverse()
-    .map((msg) => `
-      <li>
-        <div><strong>${new Date(msg.receivedAt).toLocaleTimeString()}</strong> — <em>${msg.deviceId || 'unknown-device'}</em></div>
-        <pre>${JSON.stringify(msg.payload, null, 2)}</pre>
-      </li>
     `)
     .join('');
 
@@ -129,11 +109,8 @@ app.get('/', (_req, res) => {
           ${trafficCards}
         </section>
 
-        <h2>Mensajes recibidos (<span id="messages-count">${messages.length}</span>)</h2>
-        <p>Usa <code>POST /api/messages</code> o <code>POST /api/traffic/events</code> para enviar datos desde tu ESP32.</p>
-        <ul id="messages-list">
-          ${listItems || '<li class="placeholder">No hay mensajes recibidos todavía.</li>'}
-        </ul>
+        <h2>Mensajes recibidos</h2>
+        <p>El almacenamiento en memoria está deshabilitado. Usa <code>GET /api/traffic/lights</code> para consultar el estado actual o revisa Supabase para el historial persistente.</p>
 
         <script>
           (function () {
@@ -149,9 +126,6 @@ app.get('/', (_req, res) => {
 
             const lanesContainer = document.getElementById('lanes');
             const queueBadge = document.getElementById('queue-badge');
-            const messagesCount = document.getElementById('messages-count');
-            const messagesList = document.getElementById('messages-list');
-
             const updateLaneCard = (lane) => {
               const article = lanesContainer.querySelector('[data-lane="' + lane.id + '"]');
               if (!article) return;
@@ -173,55 +147,18 @@ app.get('/', (_req, res) => {
               setField('queue', lane.waiting ? 'Sí' : 'No');
             };
 
-            const updateMessages = (payload) => {
-              messagesCount.textContent = payload.total;
-              messagesList.innerHTML = '';
-
-              if (!payload.total) {
-                const li = document.createElement('li');
-                li.className = 'placeholder';
-                li.textContent = 'No hay mensajes recibidos todavía.';
-                messagesList.appendChild(li);
-                return;
-              }
-
-              payload.data.forEach((msg) => {
-                const li = document.createElement('li');
-                const header = document.createElement('div');
-                const strong = document.createElement('strong');
-                strong.textContent = formatTime(msg.receivedAt);
-                const em = document.createElement('em');
-                em.textContent = msg.deviceId || 'unknown-device';
-                header.appendChild(strong);
-                header.appendChild(document.createTextNode(' — '));
-                header.appendChild(em);
-
-                const pre = document.createElement('pre');
-                pre.textContent = JSON.stringify(msg.payload, null, 2);
-
-                li.appendChild(header);
-                li.appendChild(pre);
-                messagesList.appendChild(li);
-              });
-            };
-
             const refresh = async () => {
               try {
-                const [trafficRes, messagesRes] = await Promise.all([
-                  fetch('/api/traffic/lights', { cache: 'no-store' }),
-                  fetch('/api/messages', { cache: 'no-store' }),
-                ]);
+                const trafficRes = await fetch('/api/traffic/lights', { cache: 'no-store' });
 
-                if (!trafficRes.ok || !messagesRes.ok) {
+                if (!trafficRes.ok) {
                   throw new Error('Respuesta HTTP inválida');
                 }
 
                 const traffic = await trafficRes.json();
-                const messagesPayload = await messagesRes.json();
 
                 queueBadge.textContent = traffic.queue.length ? traffic.queue.join(', ') : 'Vacía';
                 traffic.lanes.forEach(updateLaneCard);
-                updateMessages(messagesPayload);
               } catch (error) {
                 console.error('Error actualizando tablero', error);
               }
@@ -234,48 +171,6 @@ app.get('/', (_req, res) => {
       </body>
     </html>
   `);
-});
-
-app.get('/api/messages', (_req, res) => {
-  res.json({
-    total: messages.length,
-    data: messages.slice().reverse(),
-  });
-});
-
-app.get('/api/messages/latest', (_req, res) => {
-  if (!messages.length) {
-    res.status(204).send();
-    return;
-  }
-
-  res.json(messages[messages.length - 1]);
-});
-
-app.post('/api/messages', (req, res) => {
-  if (!req.body || Object.keys(req.body).length === 0) {
-    res.status(400).json({ message: 'Se requiere un cuerpo JSON con datos.' });
-    return;
-  }
-
-  const { deviceId } = req.body;
-
-  const entry = {
-    id: randomUUID(),
-    deviceId: typeof deviceId === 'string' ? deviceId : null,
-    payload: req.body,
-    ip: req.ip,
-    receivedAt: new Date().toISOString(),
-  };
-
-  messages.push(entry);
-  keepLatestMessages();
-  broadcast('messages', {
-    total: messages.length,
-    data: messages.slice().reverse(),
-  });
-
-  res.status(201).json({ message: 'Mensaje recibido', data: entry });
 });
 
 app.post('/api/traffic/events', async (req, res) => {
@@ -295,21 +190,10 @@ app.post('/api/traffic/events', async (req, res) => {
     });
 
     const receivedAt = new Date().toISOString();
-    const entry = {
-      id: randomUUID(),
-      type: 'traffic-event',
-      deviceId,
-      payload: req.body,
-      stateSnapshot: result.state,
-      ip: req.ip,
-      receivedAt,
-    };
-
-    messages.push(entry);
-    keepLatestMessages();
+    const eventId = randomUUID();
 
     const persistenceResult = await persistTrafficEvent({
-      id: entry.id,
+      id: eventId,
       deviceId,
       intersectionId,
       sensors,
@@ -328,11 +212,6 @@ app.post('/api/traffic/events', async (req, res) => {
       state: result.state,
       evaluation: result.evaluation,
       persistence: persistenceResult ?? { skipped: true },
-    });
-
-    broadcast('messages', {
-      total: messages.length,
-      data: messages.slice().reverse(),
     });
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -358,4 +237,4 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ message: 'Error interno del servidor' });
 });
 
-module.exports = { app, messages, trafficController };
+module.exports = { app, trafficController };
