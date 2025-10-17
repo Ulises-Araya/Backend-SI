@@ -249,6 +249,41 @@ app.post('/api/traffic/events', async (req, res) => {
   }
 });
 
+function scheduleBatchProcessing({
+  deviceId,
+  readings,
+  intersectionId,
+  intervalMs,
+  ip,
+}) {
+  readings.forEach((reading, index) => {
+    const delayMs = intervalMs * index;
+
+    const task = async () => {
+      try {
+        await processTrafficEvent(
+          {
+            deviceId,
+            sensors: reading.sensors,
+            timestamp: reading.timestamp,
+            processedAt: reading.processedAt,
+            intersectionId,
+          },
+          { ip, transport: 'http-batch' },
+        );
+      } catch (error) {
+        console.error('[batch] Error procesando lectura programada:', error.message ?? error);
+      }
+    };
+
+    if (delayMs > 0) {
+      setTimeout(task, delayMs);
+    } else {
+      setImmediate(task);
+    }
+  });
+}
+
 app.post('/api/traffic/events/batch', async (req, res) => {
   const { deviceId, readings, intersectionId } = req.body ?? {};
 
@@ -257,13 +292,13 @@ app.post('/api/traffic/events/batch', async (req, res) => {
     return;
   }
 
-  const outcomes = [];
   const errors = [];
   const spreadWindowMs = Number.isFinite(Number(process.env.BATCH_SPREAD_WINDOW_MS))
     ? Number(process.env.BATCH_SPREAD_WINDOW_MS)
     : DEFAULT_BATCH_SPREAD_WINDOW_MS;
-  const intervalMs = readings.length > 1 ? Math.floor(spreadWindowMs / readings.length) : 0;
+  const intervalMs = readings.length > 1 ? Math.max(1, Math.floor(spreadWindowMs / readings.length)) : 0;
   const baseTimestamp = Date.now();
+  const scheduledReadings = [];
 
   for (let index = 0; index < readings.length; index += 1) {
     const reading = readings[index] ?? {};
@@ -278,33 +313,16 @@ app.post('/api/traffic/events/batch', async (req, res) => {
       continue;
     }
 
-    try {
-      const outcome = await processTrafficEvent(
-        { deviceId, sensors, timestamp: eventTimestamp, processedAt: eventProcessedAt, intersectionId },
-        { ip: req.ip, transport: 'http-batch' },
-      );
-
-      outcomes.push({
-        index,
-        eventId: outcome.eventId,
-        receivedAt: outcome.receivedAt,
-        state: outcome.state,
-        evaluation: outcome.evaluation,
-        persistence: outcome.persistence,
-        intervalMs,
-        processedAt: eventProcessedAt,
-      });
-    } catch (error) {
-      errors.push({ index, message: error.message ?? 'No se pudo procesar el evento.' });
-    }
+    scheduledReadings.push({ sensors, timestamp: eventTimestamp, processedAt: eventProcessedAt });
   }
 
-  if (outcomes.length === 0) {
+  if (scheduledReadings.length === 0) {
     res.status(400).json({ message: 'No se pudieron procesar lecturas válidas.', errors });
     return;
   }
+  scheduleBatchProcessing({ deviceId, readings: scheduledReadings, intersectionId, intervalMs, ip: req.ip });
 
-  res.status(202).json({ processed: outcomes.length, results: outcomes, errors });
+  res.status(202).json({ scheduled: scheduledReadings.length, intervalMs, spreadWindowMs, errors });
 });
 
 app.get('/api/traffic/lights', (_req, res) => {

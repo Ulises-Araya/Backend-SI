@@ -47,23 +47,36 @@ describe('Traffic routes', () => {
   });
 
   test('processes batch of traffic events', async () => {
-    const payload = {
-      deviceId: 'esp32-batch-test',
-      readings: [
-        { sensors: { sensor1: 11.2 }, timestamp: Date.now() },
-        { sensors: { sensor2: 25.7 }, timestamp: Date.now() + 50 },
-      ],
-    };
+    process.env.BATCH_SPREAD_WINDOW_MS = '20';
 
-    const response = await request(app)
-      .post('/api/traffic/events/batch')
-      .send(payload)
-      .set('Content-Type', 'application/json');
+    try {
+      const payload = {
+        deviceId: 'esp32-batch-test',
+        readings: [
+          { sensors: { sensor1: 11.2 }, timestamp: Date.now() },
+          { sensors: { sensor2: 25.7 }, timestamp: Date.now() + 50 },
+        ],
+      };
 
-    expect(response.status).toBe(202);
-    expect(response.body.processed).toBe(2);
-    expect(Array.isArray(response.body.results)).toBe(true);
-    expect(response.body.results).toHaveLength(2);
-    expect(response.body.results[0].intervalMs).toBeGreaterThanOrEqual(0);
+      const response = await request(app)
+        .post('/api/traffic/events/batch')
+        .send(payload)
+        .set('Content-Type', 'application/json');
+
+      expect(response.status).toBe(202);
+      expect(response.body.scheduled).toBe(2);
+      expect(response.body.intervalMs).toBeGreaterThanOrEqual(1);
+
+      await new Promise((resolve) => setTimeout(resolve, response.body.intervalMs * payload.readings.length + 50));
+
+      const state = trafficController.getState();
+      const northLane = state.lanes.find((lane) => lane.id === 'north');
+      const westLane = state.lanes.find((lane) => lane.id === 'west');
+
+      expect(northLane?.lastDistanceCm).toBeCloseTo(11.2, 1);
+      expect(westLane?.lastDistanceCm).toBeCloseTo(25.7, 1);
+    } finally {
+      delete process.env.BATCH_SPREAD_WINDOW_MS;
+    }
   });
 });

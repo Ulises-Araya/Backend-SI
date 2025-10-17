@@ -6,7 +6,7 @@ Servidor HTTP para prototipos IoT con ESP32. Recibe mediciones de sensores ultra
 
 - **POST `/api/messages`**: recibe datos en JSON desde el ESP32 (o cualquier cliente HTTP).
 - **POST `/api/traffic/events`**: ingiere distancias medidas por los sensores ultrasónicos y actualiza la lógica del semáforo inteligente.
-- **POST `/api/traffic/events/batch`**: acepta varias lecturas juntas desde el dispositivo y las reproduce internamente como si hubieran llegado espaciadas en el tiempo.
+- **POST `/api/traffic/events/batch`**: acepta varias lecturas juntas desde el dispositivo y las reproduce internamente, encolando cada muestra para que se procese con la misma cadencia que si hubiera llegado individualmente.
 - **GET `/api/traffic/lights`**: devuelve el estado completo de los cuatro semáforos, la cola de prioridad y los parámetros configurados.
 - **GET `/api/traffic/lights/:laneId`**: responde sólo con la información del semáforo indicado (ej. `north`, `west`, `south`, `east`).
 - **GET `/api/messages`** / **`/api/messages/latest`**: historial de eventos crudo.
@@ -142,7 +142,7 @@ curl -X POST http://localhost:3000/api/traffic/events/batch `
   }'
 ```
 
-El backend distribuye cada lectura del lote dentro de una ventana configurable (por defecto 1 s) para que la lógica del semáforo las procese con la misma cadencia virtual que si hubieran llegado individualmente, sin introducir demoras reales en la petición.
+El backend encola cada lectura del lote y las ejecuta en segundo plano dentro de una ventana configurable (por defecto 1 s), por lo que la lógica del semáforo recibe las muestras respetando la cadencia esperada (~200 ms entre lecturas si se envían 5 por lote) aunque el POST responda inmediatamente.
 
 ### Respuesta esperada (JSON)
 
