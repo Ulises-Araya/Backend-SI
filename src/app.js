@@ -40,7 +40,7 @@ trafficController.on('state', (state) => {
 });
 
 async function processTrafficEvent(payload = {}, context = {}) {
-  const { deviceId, sensors, intersectionId, timestamp } = payload;
+  const { deviceId, sensors, intersectionId, timestamp, processedAt } = payload;
 
   if (!deviceId || typeof sensors !== 'object' || sensors === null) {
     const error = new Error('Se requieren los campos deviceId y sensors.');
@@ -54,6 +54,10 @@ async function processTrafficEvent(payload = {}, context = {}) {
     sensors,
     timestamp: Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now(),
   };
+
+  if (Number.isFinite(Number(processedAt))) {
+    eventPayload.processedAt = Number(processedAt);
+  }
 
   const result = trafficController.ingestEvent(eventPayload);
 
@@ -267,6 +271,7 @@ app.post('/api/traffic/events/batch', async (req, res) => {
     const eventTimestamp = Number.isFinite(Number(timestamp))
       ? Number(timestamp)
       : baseTimestamp + index * intervalMs;
+    const eventProcessedAt = baseTimestamp + index * intervalMs;
 
     if (!sensors || typeof sensors !== 'object' || sensors === null || Object.keys(sensors).length === 0) {
       errors.push({ index, message: 'Lectura inválida: se requieren sensores.' });
@@ -275,7 +280,7 @@ app.post('/api/traffic/events/batch', async (req, res) => {
 
     try {
       const outcome = await processTrafficEvent(
-        { deviceId, sensors, timestamp: eventTimestamp, intersectionId },
+        { deviceId, sensors, timestamp: eventTimestamp, processedAt: eventProcessedAt, intersectionId },
         { ip: req.ip, transport: 'http-batch' },
       );
 
@@ -287,13 +292,10 @@ app.post('/api/traffic/events/batch', async (req, res) => {
         evaluation: outcome.evaluation,
         persistence: outcome.persistence,
         intervalMs,
+        processedAt: eventProcessedAt,
       });
     } catch (error) {
       errors.push({ index, message: error.message ?? 'No se pudo procesar el evento.' });
-    }
-
-    if (intervalMs > 0 && index < readings.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
     }
   }
 

@@ -142,7 +142,7 @@ curl -X POST http://localhost:3000/api/traffic/events/batch `
   }'
 ```
 
-El backend distribuye cada lectura del lote dentro de una ventana configurable (por defecto 1 s) para que la lógica del semáforo las procese con la misma cadencia que si hubieran llegado individualmente.
+El backend distribuye cada lectura del lote dentro de una ventana configurable (por defecto 1 s) para que la lógica del semáforo las procese con la misma cadencia virtual que si hubieran llegado individualmente, sin introducir demoras reales en la petición.
 
 ### Respuesta esperada (JSON)
 
