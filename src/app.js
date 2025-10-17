@@ -37,6 +37,60 @@ trafficController.on('state', (state) => {
   broadcast('traffic-state', state);
 });
 
+async function processTrafficEvent(payload = {}, context = {}) {
+  const { deviceId, sensors, intersectionId, timestamp } = payload;
+
+  if (!deviceId || typeof sensors !== 'object' || sensors === null) {
+    const error = new Error('Se requieren los campos deviceId y sensors.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const eventPayload = {
+    deviceId,
+    intersectionId,
+    sensors,
+    timestamp: Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now(),
+  };
+
+  const result = trafficController.ingestEvent(eventPayload);
+
+  const receivedAt = new Date().toISOString();
+  const eventId = randomUUID();
+
+  let persistence = { skipped: true };
+  try {
+    const persistenceResult = await persistTrafficEvent({
+      id: eventId,
+      deviceId,
+      intersectionId,
+      sensors,
+      stateSnapshot: result.state,
+      evaluation: result.evaluation,
+      ip: context.ip ?? null,
+      transport: context.transport ?? 'http',
+      receivedAt,
+    });
+
+    if (persistenceResult?.error) {
+      console.error('[supabase] No se pudo persistir un evento de tráfico.');
+    } else if (persistenceResult) {
+      persistence = persistenceResult;
+    }
+  } catch (error) {
+    console.error('[supabase] Error inesperado persistiendo evento:', error);
+    persistence = { error: true, message: error.message };
+  }
+
+  return {
+    eventId,
+    receivedAt,
+    state: result.state,
+    evaluation: result.evaluation,
+    persistence,
+  };
+}
+
 app.get('/health', (_req, res) => {
   const currentState = trafficController.getState();
   res.json({ status: 'ok', lanes: currentState.lanes.length, queue: currentState.queue.length });
@@ -174,48 +228,66 @@ app.get('/', (_req, res) => {
 });
 
 app.post('/api/traffic/events', async (req, res) => {
-  const { deviceId, sensors, intersectionId, timestamp } = req.body || {};
-
-  if (!deviceId || typeof sensors !== 'object' || sensors === null) {
-    res.status(400).json({ message: 'Se requieren los campos deviceId y sensors.' });
-    return;
-  }
-
   try {
-    const result = trafficController.ingestEvent({
-      deviceId,
-      intersectionId,
-      sensors,
-      timestamp: Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now(),
-    });
-
-    const receivedAt = new Date().toISOString();
-    const eventId = randomUUID();
-
-    const persistenceResult = await persistTrafficEvent({
-      id: eventId,
-      deviceId,
-      intersectionId,
-      sensors,
-      stateSnapshot: result.state,
-      evaluation: result.evaluation,
-      ip: req.ip,
-      receivedAt,
-    });
-
-    if (persistenceResult?.error) {
-      console.error('[supabase] No se pudo persistir un evento de tráfico.');
-    }
+    const outcome = await processTrafficEvent(req.body, { ip: req.ip, transport: 'http' });
 
     res.status(201).json({
       message: 'Evento procesado',
-      state: result.state,
-      evaluation: result.evaluation,
-      persistence: persistenceResult ?? { skipped: true },
+      state: outcome.state,
+      evaluation: outcome.evaluation,
+      persistence: outcome.persistence,
     });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    const statusCode = error.statusCode ?? 400;
+    res.status(statusCode).json({ message: error.message ?? 'No se pudo procesar el evento.' });
   }
+});
+
+app.post('/api/traffic/events/batch', async (req, res) => {
+  const { deviceId, readings, intersectionId } = req.body ?? {};
+
+  if (!deviceId || !Array.isArray(readings) || readings.length === 0) {
+    res.status(400).json({ message: 'Se requieren deviceId y un arreglo readings con al menos un elemento.' });
+    return;
+  }
+
+  const outcomes = [];
+  const errors = [];
+
+  for (let index = 0; index < readings.length; index += 1) {
+    const reading = readings[index] ?? {};
+    const { sensors, timestamp } = reading;
+
+    if (!sensors || typeof sensors !== 'object' || sensors === null || Object.keys(sensors).length === 0) {
+      errors.push({ index, message: 'Lectura inválida: se requieren sensores.' });
+      continue;
+    }
+
+    try {
+      const outcome = await processTrafficEvent(
+        { deviceId, sensors, timestamp, intersectionId },
+        { ip: req.ip, transport: 'http-batch' },
+      );
+
+      outcomes.push({
+        index,
+        eventId: outcome.eventId,
+        receivedAt: outcome.receivedAt,
+        state: outcome.state,
+        evaluation: outcome.evaluation,
+        persistence: outcome.persistence,
+      });
+    } catch (error) {
+      errors.push({ index, message: error.message ?? 'No se pudo procesar el evento.' });
+    }
+  }
+
+  if (outcomes.length === 0) {
+    res.status(400).json({ message: 'No se pudieron procesar lecturas válidas.', errors });
+    return;
+  }
+
+  res.status(202).json({ processed: outcomes.length, results: outcomes, errors });
 });
 
 app.get('/api/traffic/lights', (_req, res) => {
@@ -240,4 +312,4 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ message: 'Error interno del servidor' });
 });
 
-module.exports = { app, trafficController };
+module.exports = { app, trafficController, processTrafficEvent };

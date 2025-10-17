@@ -45,4 +45,24 @@ describe('Traffic routes', () => {
     const missingLane = await request(app).get('/api/traffic/lights/unknown');
     expect(missingLane.status).toBe(404);
   });
+
+  test('processes batch of traffic events', async () => {
+    const payload = {
+      deviceId: 'esp32-batch-test',
+      readings: [
+        { sensors: { sensor1: 11.2 }, timestamp: Date.now() },
+        { sensors: { sensor2: 25.7 }, timestamp: Date.now() + 50 },
+      ],
+    };
+
+    const response = await request(app)
+      .post('/api/traffic/events/batch')
+      .send(payload)
+      .set('Content-Type', 'application/json');
+
+    expect(response.status).toBe(202);
+    expect(response.body.processed).toBe(2);
+    expect(Array.isArray(response.body.results)).toBe(true);
+    expect(response.body.results).toHaveLength(2);
+  });
 });

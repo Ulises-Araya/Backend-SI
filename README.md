@@ -191,5 +191,5 @@ curl -X POST http://localhost:3000/api/traffic/events `
 
 - Ampliar la consola web con filtros, gráficos y estadísticas históricas consumiendo directamente desde Supabase.
 - Añadir autenticación por token para filtrar quién puede enviar datos al backend.
-- Notificar cambios de fase mediante WebSockets o MQTT a un frontend en tiempo real.
+- Notificar cambios de fase mediante MQTT u otro canal push a un frontend en tiempo real.
 - Incorporar lógica adicional (peatones, horarios pico, prioridad a transporte público, etc.).
