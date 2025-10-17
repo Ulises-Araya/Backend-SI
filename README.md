@@ -6,6 +6,7 @@ Servidor HTTP para prototipos IoT con ESP32. Recibe mediciones de sensores ultra
 
 - **POST `/api/messages`**: recibe datos en JSON desde el ESP32 (o cualquier cliente HTTP).
 - **POST `/api/traffic/events`**: ingiere distancias medidas por los sensores ultrasónicos y actualiza la lógica del semáforo inteligente.
+- **POST `/api/traffic/events/batch`**: acepta varias lecturas juntas desde el dispositivo y las reproduce internamente como si hubieran llegado espaciadas en el tiempo.
 - **GET `/api/traffic/lights`**: devuelve el estado completo de los cuatro semáforos, la cola de prioridad y los parámetros configurados.
 - **GET `/api/traffic/lights/:laneId`**: responde sólo con la información del semáforo indicado (ej. `north`, `west`, `south`, `east`).
 - **GET `/api/messages`** / **`/api/messages/latest`**: historial de eventos crudo.
@@ -127,6 +128,22 @@ curl -X POST http://localhost:3000/api/traffic/events `
   -d '{"deviceId":"esp32-lab","sensors":{"sensor1":12.5,"sensor2":70,"sensor3":999,"sensor4":999}}'
 ```
 
+### Envío de mediciones en lote
+
+```powershell
+curl -X POST http://localhost:3000/api/traffic/events/batch `
+  -H "Content-Type: application/json" `
+  -d '{
+    "deviceId":"esp32-lab",
+    "readings":[
+      {"timestamp": 1732992000000, "sensors": {"sensor1": 12.5}},
+      {"timestamp": 1732992000200, "sensors": {"sensor1": 13.1}}
+    ]
+  }'
+```
+
+El backend distribuye cada lectura del lote dentro de una ventana configurable (por defecto 1 s) para que la lógica del semáforo las procese con la misma cadencia que si hubieran llegado individualmente.
+
 ### Respuesta esperada (JSON)
 
 ```json
@@ -174,6 +191,7 @@ curl -X POST http://localhost:3000/api/traffic/events `
 ## Configuración
 
 - `PORT`: Puerto TCP donde escucha el servidor (por defecto `3000`). Puedes definirlo en un archivo `.env` basado en el archivo `.env.example`.
+- `BATCH_SPREAD_WINDOW_MS`: ventana temporal (en milisegundos) usada para reproducir internamente las lecturas recibidas en `/api/traffic/events/batch`. Por defecto `1000`, lo que hace que 5 muestras se procesen con ~200 ms entre cada una.
 - `MAX_MESSAGES`: Número máximo de mensajes que se mantienen en memoria (por defecto `500`). Cuando se supera, se eliminan los más antiguos.
 - `DETECTION_THRESHOLD_CM`: Distancia máxima (en centímetros) para considerar que hay un vehículo delante del sensor (por defecto `30`).
 - `MIN_GREEN_MS`: Tiempo mínimo (en milisegundos) que un carril debe permanecer en verde antes de liberar el paso (por defecto `8000`).

@@ -64,5 +64,6 @@ describe('Traffic routes', () => {
     expect(response.body.processed).toBe(2);
     expect(Array.isArray(response.body.results)).toBe(true);
     expect(response.body.results).toHaveLength(2);
+    expect(response.body.results[0].intervalMs).toBeGreaterThanOrEqual(0);
   });
 });

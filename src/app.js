@@ -26,6 +26,8 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
+const DEFAULT_BATCH_SPREAD_WINDOW_MS = Number(process.env.BATCH_SPREAD_WINDOW_MS ?? 1000);
+
 function broadcast(event, payload) {
   const data = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const client of sseClients) {
@@ -253,10 +255,18 @@ app.post('/api/traffic/events/batch', async (req, res) => {
 
   const outcomes = [];
   const errors = [];
+  const spreadWindowMs = Number.isFinite(Number(process.env.BATCH_SPREAD_WINDOW_MS))
+    ? Number(process.env.BATCH_SPREAD_WINDOW_MS)
+    : DEFAULT_BATCH_SPREAD_WINDOW_MS;
+  const intervalMs = readings.length > 1 ? Math.floor(spreadWindowMs / readings.length) : 0;
+  const baseTimestamp = Date.now();
 
   for (let index = 0; index < readings.length; index += 1) {
     const reading = readings[index] ?? {};
     const { sensors, timestamp } = reading;
+    const eventTimestamp = Number.isFinite(Number(timestamp))
+      ? Number(timestamp)
+      : baseTimestamp + index * intervalMs;
 
     if (!sensors || typeof sensors !== 'object' || sensors === null || Object.keys(sensors).length === 0) {
       errors.push({ index, message: 'Lectura inválida: se requieren sensores.' });
@@ -265,7 +275,7 @@ app.post('/api/traffic/events/batch', async (req, res) => {
 
     try {
       const outcome = await processTrafficEvent(
-        { deviceId, sensors, timestamp, intersectionId },
+        { deviceId, sensors, timestamp: eventTimestamp, intersectionId },
         { ip: req.ip, transport: 'http-batch' },
       );
 
@@ -276,9 +286,14 @@ app.post('/api/traffic/events/batch', async (req, res) => {
         state: outcome.state,
         evaluation: outcome.evaluation,
         persistence: outcome.persistence,
+        intervalMs,
       });
     } catch (error) {
       errors.push({ index, message: error.message ?? 'No se pudo procesar el evento.' });
+    }
+
+    if (intervalMs > 0 && index < readings.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
     }
   }
 
