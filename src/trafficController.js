@@ -28,6 +28,7 @@ class TrafficController extends EventEmitter {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.stateByLane = new Map();
     this.eventQueue = [];
+    this._pendingPresenceEvents = [];
     this.reset();
   }
 
@@ -44,6 +45,8 @@ class TrafficController extends EventEmitter {
       redSince: isGreen ? null : now,
       cyclesCompleted: 0,
       waiting: false,
+      presenceStartedAt: null,
+      presenceTriggeredChange: false,
     };
   }
 
@@ -61,8 +64,11 @@ class TrafficController extends EventEmitter {
     const processed = Number.isFinite(Number(processedAt)) ? Number(processedAt) : Date.now();
     const eventTimestamp = Number.isFinite(Number(timestamp)) ? Number(timestamp) : processed;
 
+    this._pendingPresenceEvents = [];
     this._updatePresenceFromSensors(sensors, processed);
     const evaluation = this.evaluateStateMachine(processed);
+    const presenceEvents = this._pendingPresenceEvents;
+    this._pendingPresenceEvents = [];
 
     const payload = {
       intersectionId,
@@ -71,6 +77,7 @@ class TrafficController extends EventEmitter {
       processedAt: processed,
       state: this.getState(),
       evaluation,
+      presenceEvents,
     };
 
     this.emit('state', payload.state);
@@ -86,6 +93,7 @@ class TrafficController extends EventEmitter {
       }
 
       const laneState = this.stateByLane.get(laneId);
+      const wasOccupied = laneState.isOccupied;
       const distance = this._parseDistance(rawValue);
       laneState.lastSampleAt = now;
       laneState.lastDistanceCm = distance;
@@ -93,12 +101,30 @@ class TrafficController extends EventEmitter {
       const hasVehicle = Number.isFinite(distance) && distance <= this.config.detectionThresholdCm;
       if (hasVehicle) {
         laneState.lastVehicleAt = now;
+        if (!wasOccupied) {
+          laneState.presenceStartedAt = now;
+          laneState.presenceTriggeredChange = false;
+        }
         laneState.isOccupied = true;
         laneState.lastClearedAt = null;
         this._enqueueLane(laneId, now);
       } else {
         laneState.isOccupied = false;
         laneState.lastClearedAt = now;
+
+        if (wasOccupied && laneState.presenceStartedAt !== null) {
+          const detectedAt = laneState.presenceStartedAt;
+          const waitMs = Math.max(0, now - detectedAt);
+          this._recordPresenceEvent({
+            laneId,
+            detectedAt,
+            clearedAt: now,
+            waitMs,
+            triggeredChange: laneState.presenceTriggeredChange,
+          });
+          laneState.presenceStartedAt = null;
+          laneState.presenceTriggeredChange = false;
+        }
 
         if (laneState.waiting && laneState.state !== 'green') {
           this._removeFromQueue(laneId);
@@ -145,15 +171,15 @@ class TrafficController extends EventEmitter {
           break;
         }
 
-        transitions.push(this._changeState(laneState.id, 'yellow', now));
+        transitions.push(this._changeState(laneState.id, 'yellow', now, 'min-green-elapsed'));
         break;
       }
       case 'yellow': {
         const elapsed = now - laneState.lastChangeAt;
         if (elapsed >= this.config.yellowMs) {
-          transitions.push(this._changeState(laneState.id, 'red', now));
-          const nextLaneId = this._chooseNextLane(laneState.id, now);
-          transitions.push(this._changeState(nextLaneId, 'green', now));
+          transitions.push(this._changeState(laneState.id, 'red', now, 'yellow-elapsed'));
+          const nextLane = this._chooseNextLane(laneState.id, now);
+          transitions.push(this._changeState(nextLane.laneId, 'green', now, nextLane.reason));
         }
         break;
       }
@@ -175,11 +201,15 @@ class TrafficController extends EventEmitter {
     return this.evaluateStateMachine(now);
   }
 
-  _changeState(laneId, nextState, now) {
+  _changeState(laneId, nextState, now, reason = null) {
     const laneState = this.stateByLane.get(laneId);
     if (!laneState || laneState.state === nextState) {
       return null;
     }
+
+    const previousState = laneState.state;
+    const startedAt = laneState.lastChangeAt;
+    const durationMs = Math.max(0, now - startedAt);
 
     laneState.state = nextState;
     laneState.lastChangeAt = now;
@@ -190,6 +220,9 @@ class TrafficController extends EventEmitter {
       laneState.waiting = false;
       this._removeFromQueue(laneId);
       laneState.redSince = null;
+      if (laneState.presenceStartedAt !== null) {
+        laneState.presenceTriggeredChange = true;
+      }
     }
 
     if (nextState === 'red') {
@@ -200,26 +233,35 @@ class TrafficController extends EventEmitter {
       laneState.waiting = false;
     }
 
-    return { laneId, nextState, at: now };
+    return {
+      type: 'phase-change',
+      laneId,
+      previousState,
+      nextState,
+      startedAt,
+      endedAt: now,
+      durationMs,
+      reason,
+    };
   }
 
   _chooseNextLane(currentLaneId, now) {
     const overdueLaneId = this._findOverdueLane(now, currentLaneId);
     if (overdueLaneId) {
       this._removeFromQueue(overdueLaneId);
-      return overdueLaneId;
+      return { laneId: overdueLaneId, reason: 'max-red' };
     }
 
     while (this.eventQueue.length > 0) {
       const candidate = this.eventQueue.shift();
       if (candidate !== currentLaneId && this.stateByLane.has(candidate)) {
-        return candidate;
+        return { laneId: candidate, reason: 'queue' };
       }
     }
 
     const currentIndex = this.config.lanes.indexOf(currentLaneId);
     const nextIndex = (currentIndex + 1) % this.config.lanes.length;
-    return this.config.lanes[nextIndex];
+    return { laneId: this.config.lanes[nextIndex], reason: 'round-robin' };
   }
 
   _findOverdueLane(now, currentLaneId) {
@@ -260,6 +302,13 @@ class TrafficController extends EventEmitter {
       laneState.waiting = false;
     }
     this.eventQueue = this.eventQueue.filter((queuedLaneId) => queuedLaneId !== laneId);
+  }
+
+  _recordPresenceEvent(event) {
+    if (!Array.isArray(this._pendingPresenceEvents)) {
+      this._pendingPresenceEvents = [];
+    }
+    this._pendingPresenceEvents.push({ ...event });
   }
 
   getState() {
@@ -320,6 +369,7 @@ class TrafficController extends EventEmitter {
     });
 
     this.currentLaneId = this.config.lanes[0];
+    this._pendingPresenceEvents = [];
 
     this.emit('state', this.getState());
   }

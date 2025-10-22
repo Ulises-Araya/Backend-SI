@@ -3,16 +3,64 @@ const cors = require('cors');
 const morgan = require('morgan');
 const { randomUUID } = require('crypto');
 const TrafficController = require('./trafficController');
-const { persistTrafficEvent } = require('./persistence/trafficEventsRepository');
+const {
+  persistTrafficEvent,
+  persistPhaseChanges,
+  persistPresenceEvents,
+  persistTrafficSummary,
+  fetchPhaseTransitionCounts,
+  fetchLaneDurations,
+  fetchPresenceSamples,
+  fetchGreenCycleTrend,
+} = require('./persistence/trafficEventsRepository');
 
 const trafficController = new TrafficController();
 const sseClients = new Set();
 const TICK_INTERVAL_MS = Number(process.env.TICK_INTERVAL_MS ?? 250) || 250;
+const DEFAULT_INTERSECTION_ID = process.env.DEFAULT_INTERSECTION_ID ?? 'default';
+const SYSTEM_DEVICE_ID = process.env.SYSTEM_DEVICE_ID ?? null;
+const GREEN_TREND_BUCKET_MS = Number(process.env.GREEN_TREND_BUCKET_MS ?? 10_000) || 10_000;
 
-const trafficTickTimer = setInterval(() => {
-  const transitions = trafficController.tick();
-  if (Array.isArray(transitions) && transitions.length) {
-    console.debug('[traffic] transitions', transitions);
+const trafficTickTimer = setInterval(async () => {
+  try {
+    const transitions = trafficController.tick();
+    const phaseChanges = collapsePhaseChanges(transitions);
+    if (phaseChanges.length) {
+      console.debug('[traffic] transitions', phaseChanges);
+
+      try {
+        await persistPhaseChanges(
+          phaseChanges.map((change) => ({
+            intersectionId: DEFAULT_INTERSECTION_ID,
+            laneKey: change.laneId,
+            previousState: change.previousState,
+            nextState: change.nextState,
+            startedAt: change.startedAt,
+            endedAt: change.endedAt,
+            durationMs: change.durationMs,
+            trigger: change.reason ?? null,
+            deviceId: SYSTEM_DEVICE_ID,
+          })),
+        );
+      } catch (error) {
+        console.error('[supabase] Error guardando cambios de fase en tick:', error);
+      }
+
+      try {
+        await persistTrafficSummary({
+          id: randomUUID(),
+          intersectionId: DEFAULT_INTERSECTION_ID,
+          deviceId: SYSTEM_DEVICE_ID,
+          stateSnapshot: trafficController.getState(),
+          evaluation: phaseChanges,
+          receivedAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error('[supabase] Error guardando snapshot de tick:', error);
+      }
+    }
+  } catch (error) {
+    console.error('[traffic] Error en ciclo de tick:', error);
   }
 }, TICK_INTERVAL_MS);
 
@@ -35,12 +83,68 @@ function broadcast(event, payload) {
   }
 }
 
+function collapsePhaseChanges(transitions = []) {
+  if (!Array.isArray(transitions) || transitions.length === 0) {
+    return [];
+  }
+
+  const pendingGreen = new Map();
+  const collapsed = [];
+
+  transitions.forEach((change) => {
+    if (!change || change.type !== 'phase-change') {
+      return;
+    }
+
+    if (change.previousState === 'green' && change.nextState === 'yellow') {
+      pendingGreen.set(change.laneId, change);
+      return;
+    }
+
+    if (change.previousState === 'yellow' && change.nextState === 'red') {
+      const queued = pendingGreen.get(change.laneId);
+      if (queued) {
+        const startedAt = queued.startedAt;
+        const endedAt = change.endedAt;
+        collapsed.push({
+          type: 'phase-change',
+          laneId: change.laneId,
+          previousState: 'green',
+          nextState: 'red',
+          startedAt,
+          endedAt,
+          durationMs: Math.max(0, endedAt - startedAt),
+          reason: queued.reason ?? change.reason ?? null,
+        });
+        pendingGreen.delete(change.laneId);
+        return;
+      }
+      collapsed.push({
+        ...change,
+        previousState: 'green',
+        durationMs: Math.max(0, change.durationMs ?? 0),
+      });
+      return;
+    }
+
+    if (
+      (change.previousState === 'red' && change.nextState === 'green') ||
+      (change.previousState === 'green' && change.nextState === 'red')
+    ) {
+      collapsed.push(change);
+    }
+  });
+
+  return collapsed;
+}
+
 trafficController.on('state', (state) => {
   broadcast('traffic-state', state);
 });
 
 async function processTrafficEvent(payload = {}, context = {}) {
   const { deviceId, sensors, intersectionId, timestamp, processedAt } = payload;
+  const normalizedIntersectionId = intersectionId ?? DEFAULT_INTERSECTION_ID;
 
   if (!deviceId || typeof sensors !== 'object' || sensors === null) {
     const error = new Error('Se requieren los campos deviceId y sensors.');
@@ -50,7 +154,7 @@ async function processTrafficEvent(payload = {}, context = {}) {
 
   const eventPayload = {
     deviceId,
-    intersectionId,
+    intersectionId: normalizedIntersectionId,
     sensors,
     timestamp: Number.isFinite(Number(timestamp)) ? Number(timestamp) : Date.now(),
   };
@@ -60,6 +164,12 @@ async function processTrafficEvent(payload = {}, context = {}) {
   }
 
   const result = trafficController.ingestEvent(eventPayload);
+  const phaseChanges = collapsePhaseChanges(
+    Array.isArray(result?.evaluation)
+      ? result.evaluation.filter((item) => item && item.type === 'phase-change')
+      : [],
+  );
+  const presenceEvents = Array.isArray(result?.presenceEvents) ? result.presenceEvents : [];
 
   const receivedAt = new Date().toISOString();
   const eventId = randomUUID();
@@ -69,7 +179,7 @@ async function processTrafficEvent(payload = {}, context = {}) {
     const persistenceResult = await persistTrafficEvent({
       id: eventId,
       deviceId,
-      intersectionId,
+    intersectionId: normalizedIntersectionId,
       sensors,
       stateSnapshot: result.state,
       evaluation: result.evaluation,
@@ -88,12 +198,59 @@ async function processTrafficEvent(payload = {}, context = {}) {
     persistence = { error: true, message: error.message };
   }
 
+  let phasePersistence = { skipped: true };
+  if (phaseChanges.length) {
+    try {
+      phasePersistence = await persistPhaseChanges(
+        phaseChanges.map((change) => ({
+          intersectionId: normalizedIntersectionId,
+          laneKey: change.laneId,
+          previousState: change.previousState,
+          nextState: change.nextState,
+          startedAt: change.startedAt,
+          endedAt: change.endedAt,
+          durationMs: change.durationMs,
+          trigger: change.reason ?? null,
+          deviceId,
+        })),
+      );
+    } catch (error) {
+      console.error('[supabase] Error inesperado guardando cambios de fase:', error);
+      phasePersistence = { error: true, message: error.message };
+    }
+  }
+
+  let presencePersistence = { skipped: true };
+  if (presenceEvents.length) {
+    try {
+      presencePersistence = await persistPresenceEvents(
+        presenceEvents.map((event) => ({
+          intersectionId: normalizedIntersectionId,
+          laneKey: event.laneId,
+          deviceId,
+          detectedAt: event.detectedAt,
+          clearedAt: event.clearedAt,
+          waitMs: event.waitMs,
+          triggeredChange: event.triggeredChange ?? false,
+        })),
+      );
+    } catch (error) {
+      console.error('[supabase] Error inesperado guardando eventos de presencia:', error);
+      presencePersistence = { error: true, message: error.message };
+    }
+  }
+
   return {
     eventId,
     receivedAt,
     state: result.state,
     evaluation: result.evaluation,
+  intersectionId: normalizedIntersectionId,
+  presenceEvents,
+  phaseChanges,
     persistence,
+    phasePersistence,
+    presencePersistence,
   };
 }
 
@@ -241,7 +398,11 @@ app.post('/api/traffic/events', async (req, res) => {
       message: 'Evento procesado',
       state: outcome.state,
       evaluation: outcome.evaluation,
+      phaseChanges: outcome.phaseChanges,
+      presenceEvents: outcome.presenceEvents,
       persistence: outcome.persistence,
+      phasePersistence: outcome.phasePersistence,
+      presencePersistence: outcome.presencePersistence,
     });
   } catch (error) {
     const statusCode = error.statusCode ?? 400;
@@ -340,6 +501,84 @@ app.get('/api/traffic/lights/:laneId', (req, res) => {
   }
 
   res.json(laneState);
+});
+
+app.get('/api/analytics/overview', async (req, res) => {
+  const intersectionId = req.query.intersectionId ?? DEFAULT_INTERSECTION_ID;
+
+  try {
+    const [transitionCountsRaw, laneDurationsRaw, presenceSamplesRaw, greenTrendRaw] = await Promise.all([
+      fetchPhaseTransitionCounts({ intersectionId }),
+      fetchLaneDurations({ intersectionId }),
+      fetchPresenceSamples({ intersectionId, limit: 400 }),
+      fetchGreenCycleTrend({ intersectionId, limit: 200 }),
+    ]);
+
+    const transitionCounts = transitionCountsRaw.map((row) => ({
+      laneKey: row.lane_key,
+      toState: row.next_state,
+      count: Number(row.count) || 0,
+    }));
+
+    const laneDurations = laneDurationsRaw.map((row) => ({
+      laneKey: row.laneKey ?? row.lane_key,
+      greenMs: Number(row.greenMs ?? row.green_ms) || 0,
+      redMs: Number(row.redMs ?? row.red_ms) || 0,
+    }));
+
+    const greenShare = laneDurations.map((row) => {
+      const total = row.greenMs + row.redMs;
+      return {
+        laneKey: row.laneKey,
+        greenRatio: total > 0 ? row.greenMs / total : 0,
+      };
+    });
+
+    const presenceSamples = presenceSamplesRaw.map((row) => ({
+      laneKey: row.lane_key,
+      waitMs: Number(row.wait_ms) || 0,
+      detectedAt: row.detected_at,
+    }));
+
+    const trendBuckets = new Map();
+    greenTrendRaw.forEach((row) => {
+      if (!row?.ended_at) {
+        return;
+      }
+      const ended = new Date(row.ended_at);
+      if (Number.isNaN(ended.getTime())) {
+        return;
+      }
+      const alignedMs = Math.floor(ended.getTime() / GREEN_TREND_BUCKET_MS) * GREEN_TREND_BUCKET_MS;
+      const isoKey = new Date(alignedMs).toISOString();
+      if (!trendBuckets.has(isoKey)) {
+        trendBuckets.set(isoKey, { bucket: isoKey, totalMs: 0, count: 0 });
+      }
+      const bucket = trendBuckets.get(isoKey);
+      bucket.totalMs += Number(row.duration_ms) || 0;
+      bucket.count += 1;
+    });
+
+    const greenCycleTrend = Array.from(trendBuckets.values())
+      .sort((a, b) => (a.bucket < b.bucket ? -1 : a.bucket > b.bucket ? 1 : 0))
+      .map((entry) => ({
+        bucket: entry.bucket,
+        avgGreenMs: entry.count > 0 ? entry.totalMs / entry.count : 0,
+        sampleCount: entry.count,
+      }));
+
+    res.json({
+      intersectionId,
+      transitionCounts,
+      laneDurations,
+      greenShare,
+      presenceSamples,
+      greenCycleTrend,
+    });
+  } catch (error) {
+    console.error('[analytics] No se pudo obtener overview:', error);
+    res.status(500).json({ message: 'No se pudo obtener datos analíticos' });
+  }
 });
 
 app.use((err, _req, res, _next) => {
