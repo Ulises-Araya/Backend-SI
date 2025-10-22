@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const { randomUUID } = require('crypto');
+const WebSocket = require('ws');
 const TrafficController = require('./trafficController');
 const {
   persistTrafficEvent,
@@ -21,8 +22,40 @@ const DEFAULT_INTERSECTION_ID = process.env.DEFAULT_INTERSECTION_ID ?? 'default'
 const SYSTEM_DEVICE_ID = process.env.SYSTEM_DEVICE_ID ?? null;
 const GREEN_TREND_BUCKET_MS = Number(process.env.GREEN_TREND_BUCKET_MS ?? 10_000) || 10_000;
 
+// Estado de conexiones
+let databaseConnected = false;
+let esp32Connected = false;
+
+// Función para verificar conexión a base de datos
+async function checkDatabaseConnection() {
+  try {
+    const client = require('./persistence/supabaseClient').getClient();
+    if (!client) {
+      databaseConnected = false;
+      return;
+    }
+    
+    // Intentar una consulta simple para verificar conexión
+    const { error } = await client.from('traffic_events').select('count').limit(1);
+    databaseConnected = !error;
+  } catch (error) {
+    databaseConnected = false;
+  }
+}
+
+// Función helper para obtener estado con información de conexiones
+function getTrafficStateWithConnections() {
+  return trafficController.getState({
+    databaseConnected,
+    esp32Connected,
+  });
+}
+
 const trafficTickTimer = setInterval(async () => {
   try {
+    // Verificar conexión a base de datos periódicamente
+    await checkDatabaseConnection();
+    
     const transitions = trafficController.tick();
     const phaseChanges = collapsePhaseChanges(transitions);
     if (phaseChanges.length) {
@@ -51,7 +84,7 @@ const trafficTickTimer = setInterval(async () => {
           id: randomUUID(),
           intersectionId: DEFAULT_INTERSECTION_ID,
           deviceId: SYSTEM_DEVICE_ID,
-          stateSnapshot: trafficController.getState(),
+          stateSnapshot: getTrafficStateWithConnections(),
           evaluation: phaseChanges,
           receivedAt: new Date().toISOString(),
         });
@@ -73,6 +106,31 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
+
+const server = require('http').createServer(app);
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws) => {
+  console.log('[ws] Client connected');
+  esp32Connected = true;
+  ws.send(JSON.stringify(getTrafficStateWithConnections()));
+
+  ws.on('close', () => {
+    console.log('[ws] Client disconnected');
+    // Verificar si aún hay otros clientes conectados
+    setTimeout(() => {
+      esp32Connected = wss.clients.size > 0;
+    }, 100);
+  });
+});
+
+trafficController.on('state', (state) => {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(getTrafficStateWithConnections()));
+    }
+  });
+});
 
 const DEFAULT_BATCH_SPREAD_WINDOW_MS = Number(process.env.BATCH_SPREAD_WINDOW_MS ?? 1000);
 
@@ -255,7 +313,7 @@ async function processTrafficEvent(payload = {}, context = {}) {
 }
 
 app.get('/health', (_req, res) => {
-  const currentState = trafficController.getState();
+  const currentState = getTrafficStateWithConnections();
   res.json({ status: 'ok', lanes: currentState.lanes.length, queue: currentState.queue.length });
 });
 
@@ -266,7 +324,7 @@ app.get('/api/traffic/stream', (req, res) => {
   res.flushHeaders?.();
 
   res.write(`retry: 3000\n`);
-  res.write(`event: traffic-state\ndata: ${JSON.stringify(trafficController.getState())}\n\n`);
+  res.write(`event: traffic-state\ndata: ${JSON.stringify(getTrafficStateWithConnections())}\n\n`);
 
   sseClients.add(res);
 
@@ -277,7 +335,7 @@ app.get('/api/traffic/stream', (req, res) => {
 });
 
 app.get('/', (_req, res) => {
-  const trafficState = trafficController.getState();
+  const trafficState = getTrafficStateWithConnections();
   const trafficCards = trafficState.lanes
     .map((lane) => `
       <article class="lane lane--${lane.state}" data-lane="${lane.id}">
@@ -490,7 +548,7 @@ app.get('/api/traffic/lights', (_req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-  res.json(trafficController.getState());
+  res.json(getTrafficStateWithConnections());
 });
 
 app.get('/api/traffic/lights/:laneId', (req, res) => {
@@ -586,4 +644,4 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ message: 'Error interno del servidor' });
 });
 
-module.exports = { app, trafficController, processTrafficEvent };
+module.exports = { app, server, trafficController, processTrafficEvent };

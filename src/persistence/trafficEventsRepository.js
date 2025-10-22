@@ -4,6 +4,7 @@ const TABLE_TRAFFIC_EVENTS = (process.env.SUPABASE_TRAFFIC_EVENTS_TABLE || '').t
 const TABLE_PHASE_CHANGES = process.env.SUPABASE_PHASE_CHANGES_TABLE || 'traffic_phase_changes';
 const TABLE_PRESENCE_EVENTS = process.env.SUPABASE_PRESENCE_EVENTS_TABLE || 'traffic_presence_events';
 const TABLE_EVENTS_SUMMARY = process.env.SUPABASE_EVENTS_SUMMARY_TABLE || 'traffic_events_summary';
+const DISABLE_SUPABASE = process.env.DISABLE_SUPABASE === 'true';
 
 function isAggregateNotAllowed(error) {
   if (!error) {
@@ -23,6 +24,9 @@ function isAggregateNotAllowed(error) {
 }
 
 async function persistTrafficEvent(event) {
+  if (DISABLE_SUPABASE) {
+    return { skipped: true };
+  }
   const client = getClient();
   if (!client || !TABLE_TRAFFIC_EVENTS) {
     return { skipped: true };
@@ -48,6 +52,9 @@ async function persistTrafficEvent(event) {
 }
 
 async function persistPhaseChanges(changes = []) {
+  if (DISABLE_SUPABASE) {
+    return { skipped: true };
+  }
   if (!Array.isArray(changes) || changes.length === 0) {
     return { skipped: true };
   }
@@ -80,6 +87,9 @@ async function persistPhaseChanges(changes = []) {
 }
 
 async function persistPresenceEvents(events = []) {
+  if (DISABLE_SUPABASE) {
+    return { skipped: true };
+  }
   if (!Array.isArray(events) || events.length === 0) {
     return { skipped: true };
   }
@@ -110,6 +120,9 @@ async function persistPresenceEvents(events = []) {
 }
 
 async function persistTrafficSummary(summary) {
+  if (DISABLE_SUPABASE) {
+    return { skipped: true };
+  }
   if (!summary) {
     return { skipped: true };
   }

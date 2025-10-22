@@ -29,6 +29,7 @@ class TrafficController extends EventEmitter {
     this.stateByLane = new Map();
     this.eventQueue = [];
     this._pendingPresenceEvents = [];
+    this.nextLaneId = null;
     this.reset();
   }
 
@@ -171,15 +172,18 @@ class TrafficController extends EventEmitter {
           break;
         }
 
+        const next = this._chooseNextLane(laneState.id, now);
+        this.nextLaneId = next.laneId;
         transitions.push(this._changeState(laneState.id, 'yellow', now, 'min-green-elapsed'));
+        transitions.push(this._changeState(this.nextLaneId, 'red_yellow', now, 'preparing-for-green'));
         break;
       }
       case 'yellow': {
         const elapsed = now - laneState.lastChangeAt;
         if (elapsed >= this.config.yellowMs) {
           transitions.push(this._changeState(laneState.id, 'red', now, 'yellow-elapsed'));
-          const nextLane = this._chooseNextLane(laneState.id, now);
-          transitions.push(this._changeState(nextLane.laneId, 'green', now, nextLane.reason));
+          transitions.push(this._changeState(this.nextLaneId, 'green', now, 'yellow-elapsed'));
+          this.nextLaneId = null;
         }
         break;
       }
@@ -311,7 +315,7 @@ class TrafficController extends EventEmitter {
     this._pendingPresenceEvents.push({ ...event });
   }
 
-  getState() {
+  getState(options = {}) {
     const now = Date.now();
 
     return {
@@ -334,6 +338,8 @@ class TrafficController extends EventEmitter {
       }),
       queue: [...this.eventQueue],
       config: this.config,
+      databaseConnected: options.databaseConnected ?? false,
+      esp32Connected: options.esp32Connected ?? false,
     };
   }
 
@@ -369,6 +375,7 @@ class TrafficController extends EventEmitter {
     });
 
     this.currentLaneId = this.config.lanes[0];
+    this.nextLaneId = null;
     this._pendingPresenceEvents = [];
 
     this.emit('state', this.getState());
