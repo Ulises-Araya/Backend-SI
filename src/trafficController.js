@@ -3,12 +3,12 @@ const { EventEmitter } = require('events');
 const DEFAULT_CONFIG = {
   lanes: ['north', 'west', 'south', 'east'],
   sensorMap: {
-    sensor1: 'north',
-    sensor2: 'west',
-    sensor3: 'south',
-    sensor4: 'east',
+    sensor1: 'east',
+    sensor2: 'south',
+    sensor3: 'north',
+    sensor4: 'west',
   },
-  detectionThresholdCm: Number(process.env.DETECTION_THRESHOLD_CM || 30),
+  detectionThresholdCm: Number(process.env.DETECTION_THRESHOLD_CM || 13.6),
   presenceTimeoutMs: Number(process.env.PRESENCE_TIMEOUT_MS || 10_000),
   minGreenMs: Number(process.env.MIN_GREEN_MS || 8_000),
   maxGreenMs: Number(process.env.MAX_GREEN_MS || 20_000),

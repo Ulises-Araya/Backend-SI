@@ -23,7 +23,7 @@ describe('TrafficController', () => {
 
     controller.ingestEvent({
       deviceId: 'esp32',
-      sensors: { sensor2: 15 },
+      sensors: { sensor2: 10 },
       timestamp: now + 100,
       processedAt: now + 100,
     });
@@ -33,10 +33,10 @@ describe('TrafficController', () => {
 
     const state = controller.getState();
     const north = state.lanes.find((lane) => lane.id === 'north');
-    const west = state.lanes.find((lane) => lane.id === 'west');
+    const south = state.lanes.find((lane) => lane.id === 'south');
 
     expect(north.state).toBe('red');
-    expect(west.state).toBe('green');
+    expect(south.state).toBe('green');
     expect(state.queue).toHaveLength(0);
   });
 
@@ -46,7 +46,7 @@ describe('TrafficController', () => {
 
     controller.ingestEvent({
       deviceId: 'esp32',
-      sensors: { sensor3: 10 },
+      sensors: { sensor2: 10 },
       timestamp: now + 100,
       processedAt: now + 100,
     });
@@ -56,7 +56,7 @@ describe('TrafficController', () => {
 
     controller.ingestEvent({
       deviceId: 'esp32',
-      sensors: { sensor4: 12 },
+      sensors: { sensor1: 12 },
       timestamp: now + 2_000,
       processedAt: now + 2_000,
     });
@@ -64,7 +64,7 @@ describe('TrafficController', () => {
     // El vehículo del carril sur avanza (distancia > umbral) para permitir cambio de fase
     controller.ingestEvent({
       deviceId: 'esp32',
-      sensors: { sensor3: 999, sensor4: 12 },
+      sensors: { sensor2: 999, sensor1: 12 },
       timestamp: now + 2_200,
       processedAt: now + 2_200,
     });
@@ -72,14 +72,14 @@ describe('TrafficController', () => {
     controller.evaluateStateMachine(now + 3_200);
     controller.evaluateStateMachine(now + 3_800);
     controller.evaluateStateMachine(now + 4_400);
-  controller.evaluateStateMachine(now + 5_000);
+    controller.evaluateStateMachine(now + 5_000);
 
     const state = controller.getState();
     const south = state.lanes.find((lane) => lane.id === 'south');
     const east = state.lanes.find((lane) => lane.id === 'east');
 
-  expect(['red', 'yellow']).toContain(south.state);
-  expect(east.state).toBe('green');
+    expect(['red', 'yellow']).toContain(south.state);
+    expect(east.state).toBe('green');
   });
 
   test('cycles automatically when no vehicles are detected', () => {
@@ -123,7 +123,7 @@ describe('TrafficController', () => {
 
     controller.ingestEvent({
       deviceId: 'esp32',
-      sensors: { sensor1: 10, sensor2: 12 },
+      sensors: { sensor3: 10, sensor2: 12 },
       timestamp: start + 20,
       processedAt: start + 20,
     });
@@ -134,7 +134,7 @@ describe('TrafficController', () => {
 
     controller.ingestEvent({
       deviceId: 'esp32',
-      sensors: { sensor1: 999, sensor2: 12 },
+      sensors: { sensor3: 999, sensor2: 12 },
       timestamp: start + 220,
       processedAt: start + 220,
     });
@@ -143,7 +143,7 @@ describe('TrafficController', () => {
     state = controller.getState();
     expect(state.lanes.find((lane) => lane.id === 'north').state).toBe('green');
 
-  controller.tick(start + 480);
+    controller.tick(start + 480);
     state = controller.getState();
     expect(state.lanes.find((lane) => lane.id === 'north').state).not.toBe('green');
   });
@@ -164,14 +164,14 @@ describe('TrafficController', () => {
 
     controller.ingestEvent({
       deviceId: 'esp32',
-      sensors: { sensor1: 12 },
+      sensors: { sensor3: 12 },
       timestamp: start + 100,
       processedAt: start + 100,
     });
 
     controller.ingestEvent({
       deviceId: 'esp32',
-      sensors: { sensor1: 999 },
+      sensors: { sensor3: 999 },
       timestamp: start + 900,
       processedAt: start + 900,
     });
@@ -190,7 +190,7 @@ describe('TrafficController', () => {
 
     controller.ingestEvent({
       deviceId: 'esp32',
-      sensors: { sensor2: 12 },
+      sensors: { sensor4: 12 },
       timestamp: now + 50,
       processedAt: now + 50,
     });
@@ -200,7 +200,7 @@ describe('TrafficController', () => {
 
     controller.ingestEvent({
       deviceId: 'esp32',
-      sensors: { sensor2: 999 },
+      sensors: { sensor4: 999 },
       timestamp: now + 100,
       processedAt: now + 100,
     });

@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const { randomUUID } = require('crypto');
-const WebSocket = require('ws');
+const http = require('http');
 const TrafficController = require('./trafficController');
 const {
   persistTrafficEvent,
@@ -14,6 +14,13 @@ const {
   fetchPresenceSamples,
   fetchGreenCycleTrend,
 } = require('./persistence/trafficEventsRepository');
+const {
+  INTERSECTION_STATUSES,
+  listIntersections,
+  createIntersection,
+  updateIntersectionStatus,
+  updateIntersectionCoords,
+} = require('./persistence/intersectionsRepository');
 
 const trafficController = new TrafficController();
 const sseClients = new Set();
@@ -21,15 +28,35 @@ const TICK_INTERVAL_MS = Number(process.env.TICK_INTERVAL_MS ?? 250) || 250;
 const DEFAULT_INTERSECTION_ID = process.env.DEFAULT_INTERSECTION_ID ?? 'default';
 const SYSTEM_DEVICE_ID = process.env.SYSTEM_DEVICE_ID ?? null;
 const GREEN_TREND_BUCKET_MS = Number(process.env.GREEN_TREND_BUCKET_MS ?? 10_000) || 10_000;
+const ESP32_HEARTBEAT_TIMEOUT_MS = Number(process.env.ESP32_HEARTBEAT_TIMEOUT_MS ?? 15_000) || 15_000;
+const IS_TEST_ENV = process.env.NODE_ENV === 'test';
 
 // Estado de conexiones
 let databaseConnected = false;
 let esp32Connected = false;
+let esp32LastSeenAt = null;
+
+function registerEsp32Heartbeat() {
+  esp32LastSeenAt = Date.now();
+}
+
+function computeEsp32ConnectionStatus(now = Date.now()) {
+  if (!esp32LastSeenAt) {
+    return false;
+  }
+  return now - esp32LastSeenAt <= ESP32_HEARTBEAT_TIMEOUT_MS;
+}
 
 // Función para verificar conexión a base de datos
 async function checkDatabaseConnection() {
+  if (IS_TEST_ENV) {
+    databaseConnected = false;
+    return;
+  }
+
   try {
-    const client = require('./persistence/supabaseClient').getClient();
+    const { getClient } = require('./persistence/supabaseClient');
+    const client = getClient();
     if (!client) {
       databaseConnected = false;
       return;
@@ -44,14 +71,65 @@ async function checkDatabaseConnection() {
 }
 
 // Función helper para obtener estado con información de conexiones
-function getTrafficStateWithConnections() {
-  return trafficController.getState({
+function getTrafficStateWithConnections(options = {}) {
+  const { intersectionId = DEFAULT_INTERSECTION_ID } = options;
+  const now = Date.now();
+  const computedEsp32Connected = computeEsp32ConnectionStatus(now);
+  esp32Connected = computedEsp32Connected;
+
+  const state = trafficController.getState({
     databaseConnected,
-    esp32Connected,
+    esp32Connected: computedEsp32Connected,
   });
+
+  return {
+    ...state,
+    intersectionId,
+    esp32Connected: computedEsp32Connected,
+    esp32LastSeenAt,
+  };
 }
 
-const trafficTickTimer = setInterval(async () => {
+function buildFallbackIntersectionsResponse(filters = {}) {
+  const intersectionIdFromFilter = Array.isArray(filters.ids) && filters.ids.length === 1 ? filters.ids[0] : undefined;
+  const intersectionId = typeof intersectionIdFromFilter === 'string' ? intersectionIdFromFilter : DEFAULT_INTERSECTION_ID;
+  const state = getTrafficStateWithConnections({ intersectionId });
+  const nowIso = new Date().toISOString();
+  const lanes = state.lanes.map((lane) => lane.id);
+
+  const fallback = {
+    id: DEFAULT_INTERSECTION_ID,
+    name: 'Intersección predeterminada',
+    latitude: null,
+    longitude: null,
+    status: 'operational',
+    last_seen: state.timestamp ? new Date(state.timestamp).toISOString() : nowIso,
+    location: null,
+    meta: {
+      lanes,
+      notes: 'Persistencia deshabilitada. Mostrando datos en memoria.',
+    },
+    created_at: nowIso,
+    updated_at: nowIso,
+  };
+
+  const requestedStatus = typeof filters.status === 'string' ? filters.status : undefined;
+  const idsFilter = Array.isArray(filters.ids) ? filters.ids : undefined;
+
+  const matchesStatus = !requestedStatus || requestedStatus === fallback.status;
+  const matchesId = !idsFilter || idsFilter.length === 0 || idsFilter.includes(fallback.id);
+
+  const intersections = matchesStatus && matchesId ? [fallback] : [];
+
+  return {
+    intersections,
+    statusOptions: INTERSECTION_STATUSES,
+    persistenceDisabled: true,
+  };
+}
+const trafficTickTimer = IS_TEST_ENV
+  ? null
+  : setInterval(async () => {
   try {
     // Verificar conexión a base de datos periódicamente
     await checkDatabaseConnection();
@@ -95,9 +173,9 @@ const trafficTickTimer = setInterval(async () => {
   } catch (error) {
     console.error('[traffic] Error en ciclo de tick:', error);
   }
-}, TICK_INTERVAL_MS);
+  }, TICK_INTERVAL_MS);
 
-if (typeof trafficTickTimer.unref === 'function') {
+if (trafficTickTimer && typeof trafficTickTimer.unref === 'function') {
   trafficTickTimer.unref();
 }
 
@@ -107,30 +185,7 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
-const server = require('http').createServer(app);
-const wss = new WebSocket.Server({ server });
-
-wss.on('connection', (ws) => {
-  console.log('[ws] Client connected');
-  esp32Connected = true;
-  ws.send(JSON.stringify(getTrafficStateWithConnections()));
-
-  ws.on('close', () => {
-    console.log('[ws] Client disconnected');
-    // Verificar si aún hay otros clientes conectados
-    setTimeout(() => {
-      esp32Connected = wss.clients.size > 0;
-    }, 100);
-  });
-});
-
-trafficController.on('state', (state) => {
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(getTrafficStateWithConnections()));
-    }
-  });
-});
+const server = http.createServer(app);
 
 const DEFAULT_BATCH_SPREAD_WINDOW_MS = Number(process.env.BATCH_SPREAD_WINDOW_MS ?? 1000);
 
@@ -209,6 +264,8 @@ async function processTrafficEvent(payload = {}, context = {}) {
     error.statusCode = 400;
     throw error;
   }
+
+  registerEsp32Heartbeat();
 
   const eventPayload = {
     deviceId,
@@ -332,6 +389,164 @@ app.get('/api/traffic/stream', (req, res) => {
     sseClients.delete(res);
     res.end();
   });
+});
+
+app.get('/api/intersections', async (req, res) => {
+  try {
+    const { status, ids } = req.query;
+    const filters = {};
+
+    if (typeof status === 'string' && status.trim()) {
+      if (!INTERSECTION_STATUSES.includes(status.trim())) {
+        return res.status(400).json({ message: `Estado inválido. Opciones: ${INTERSECTION_STATUSES.join(', ')}` });
+      }
+      filters.status = status.trim();
+    }
+
+    if (ids) {
+      const list = Array.isArray(ids) ? ids : String(ids).split(',');
+      const normalized = list.map((value) => String(value).trim()).filter(Boolean);
+      if (normalized.length > 0) {
+        filters.ids = normalized;
+      }
+    }
+
+    const result = await listIntersections(filters);
+
+    if (result.skipped) {
+      return res.json(buildFallbackIntersectionsResponse(filters));
+    }
+
+    if (result.error) {
+      console.error('[supabase] Error listando intersecciones:', result.error);
+      return res.status(500).json({ message: 'No se pudieron obtener las intersecciones.' });
+    }
+
+    res.json({ intersections: result.data, statusOptions: INTERSECTION_STATUSES });
+  } catch (error) {
+    console.error('[api] Error en GET /api/intersections:', error);
+    res.status(500).json({ message: 'Error interno al consultar intersecciones.' });
+  }
+});
+
+app.post('/api/intersections', async (req, res) => {
+  try {
+    const { name, status, location, meta } = req.body ?? {};
+    const normalizedStatus = typeof status === 'string' ? status.trim() : undefined;
+
+    if (typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ message: 'El nombre de la intersección es obligatorio.' });
+    }
+
+    if (normalizedStatus && !INTERSECTION_STATUSES.includes(normalizedStatus)) {
+      return res.status(400).json({ message: `Estado inválido. Opciones: ${INTERSECTION_STATUSES.join(', ')}` });
+    }
+
+    if (location != null && typeof location !== 'object') {
+      return res.status(400).json({ message: 'El campo location debe ser un objeto JSON.' });
+    }
+
+    if (meta != null && typeof meta !== 'object') {
+      return res.status(400).json({ message: 'El campo meta debe ser un objeto JSON.' });
+    }
+
+    const result = await createIntersection({
+      name: name.trim(),
+      status: normalizedStatus,
+      location: location ?? null,
+      meta: meta ?? null,
+    });
+
+    if (result.skipped) {
+      return res.status(503).json({ message: 'La persistencia de intersecciones está deshabilitada o sin configurar.' });
+    }
+
+    if (result.error) {
+      console.error('[supabase] Error creando intersección:', result.error);
+      return res.status(500).json({ message: 'No se pudo crear la intersección.' });
+    }
+
+    res.status(201).json({ intersection: result.data, statusOptions: INTERSECTION_STATUSES });
+  } catch (error) {
+    console.error('[api] Error en POST /api/intersections:', error);
+    res.status(500).json({ message: 'Error interno al crear la intersección.' });
+  }
+});
+
+app.put('/api/intersections/:intersectionId/status', async (req, res) => {
+  try {
+    const { intersectionId } = req.params;
+    const { status } = req.body ?? {};
+    const trimmedId = typeof intersectionId === 'string' ? intersectionId.trim() : '';
+    const normalizedStatus = typeof status === 'string' ? status.trim() : '';
+
+    if (!trimmedId) {
+      return res.status(400).json({ message: 'El identificador de la intersección es obligatorio.' });
+    }
+
+    if (!normalizedStatus || !INTERSECTION_STATUSES.includes(normalizedStatus)) {
+      return res.status(400).json({ message: `Estado inválido. Opciones: ${INTERSECTION_STATUSES.join(', ')}` });
+    }
+
+    const result = await updateIntersectionStatus(trimmedId, normalizedStatus);
+
+    if (result.skipped) {
+      return res.status(503).json({ message: 'La persistencia de intersecciones está deshabilitada o sin configurar.' });
+    }
+
+    if (result.error) {
+      console.error('[supabase] Error actualizando estado de intersección:', result.error);
+      return res.status(500).json({ message: 'No se pudo actualizar el estado de la intersección.' });
+    }
+
+    if (!result.data) {
+      return res.status(404).json({ message: 'Intersección no encontrada.' });
+    }
+
+    res.json({ intersection: result.data, statusOptions: INTERSECTION_STATUSES });
+  } catch (error) {
+    console.error('[api] Error en PUT /api/intersections/:intersectionId/status:', error);
+    res.status(500).json({ message: 'Error interno al actualizar la intersección.' });
+  }
+});
+
+app.put('/api/intersections/:intersectionId', async (req, res) => {
+  try {
+    const { intersectionId } = req.params;
+    const { latitude, longitude } = req.body ?? {};
+    const trimmedId = typeof intersectionId === 'string' ? intersectionId.trim() : '';
+
+    if (!trimmedId) {
+      return res.status(400).json({ message: 'El identificador de la intersección es obligatorio.' });
+    }
+
+    const lat = typeof latitude === 'number' ? latitude : null;
+    const lng = typeof longitude === 'number' ? longitude : null;
+
+    if (lat === null || lng === null) {
+      return res.status(400).json({ message: 'Latitude y longitude deben ser números válidos.' });
+    }
+
+    const result = await updateIntersectionCoords(trimmedId, lat, lng);
+
+    if (result.skipped) {
+      return res.status(503).json({ message: 'La persistencia de intersecciones está deshabilitada o sin configurar.' });
+    }
+
+    if (result.error) {
+      console.error('[supabase] Error actualizando coordenadas de intersección:', result.error);
+      return res.status(500).json({ message: 'No se pudieron actualizar las coordenadas de la intersección.' });
+    }
+
+    if (!result.data) {
+      return res.status(404).json({ message: 'Intersección no encontrada.' });
+    }
+
+    res.json({ intersection: result.data, statusOptions: INTERSECTION_STATUSES });
+  } catch (error) {
+    console.error('[api] Error en PUT /api/intersections/:intersectionId:', error);
+    res.status(500).json({ message: 'Error interno al actualizar la intersección.' });
+  }
 });
 
 app.get('/', (_req, res) => {
@@ -544,11 +759,21 @@ app.post('/api/traffic/events/batch', async (req, res) => {
   res.status(202).json({ scheduled: scheduledReadings.length, intervalMs, spreadWindowMs, errors });
 });
 
-app.get('/api/traffic/lights', (_req, res) => {
+app.get('/api/traffic/lights', (req, res) => {
+  const intersectionId = typeof req.query.intersectionId === 'string' && req.query.intersectionId.trim()
+    ? req.query.intersectionId.trim()
+    : DEFAULT_INTERSECTION_ID;
+  const deviceId = typeof req.query.deviceId === 'string' && req.query.deviceId.trim()
+    ? req.query.deviceId.trim()
+    : null;
+
+  if (deviceId) {
+    registerEsp32Heartbeat();
+  }
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-  res.json(getTrafficStateWithConnections());
+  res.json(getTrafficStateWithConnections({ intersectionId }));
 });
 
 app.get('/api/traffic/lights/:laneId', (req, res) => {

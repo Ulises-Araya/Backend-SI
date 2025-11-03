@@ -128,3 +128,51 @@ if not exists idx_phase_changes_intersection_started on public.traffic_phase_cha
 create index
 if not exists idx_presence_events_intersection_detected on public.traffic_presence_events
 (intersection_id, detected_at);
+
+-- Campos extendidos para catálogo de intersecciones
+alter table
+if exists public.intersections
+add column
+if not exists status text not null default 'operational';
+
+alter table
+if exists public.intersections
+add column
+if not exists last_seen timestamptz;
+
+alter table
+if exists public.intersections
+add column
+if not exists location jsonb;
+
+alter table
+if exists public.intersections
+add column
+if not exists meta jsonb;
+
+alter table
+if exists public.intersections
+add column
+if not exists updated_at timestamptz not null default now
+();
+
+create or replace function public.set_updated_at_timestamp
+()
+returns trigger as
+$$
+begin
+  new.updated_at := now
+();
+return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_intersections_set_updated_at
+on public.intersections;
+create trigger trg_intersections_set_updated_at
+before
+update on public.intersections
+for each row
+execute function
+public.set_updated_at_timestamp
+();

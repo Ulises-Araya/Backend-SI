@@ -27,8 +27,8 @@ describe('Traffic routes', () => {
       .send(payload)
       .set('Content-Type', 'application/json');
 
-    expect(response.status).toBe(201);
-    expect(response.body.state.queue).toContain('west');
+  expect(response.status).toBe(201);
+  expect(response.body.state.queue).toContain('south');
     expect(response.body.evaluation).toBeInstanceOf(Array);
   });
 
@@ -53,7 +53,7 @@ describe('Traffic routes', () => {
       const payload = {
         deviceId: 'esp32-batch-test',
         readings: [
-          { sensors: { sensor1: 11.2 }, timestamp: Date.now() },
+          { sensors: { sensor3: 11.2 }, timestamp: Date.now() },
           { sensors: { sensor2: 25.7 }, timestamp: Date.now() + 50 },
         ],
       };
@@ -70,11 +70,11 @@ describe('Traffic routes', () => {
       await new Promise((resolve) => setTimeout(resolve, response.body.intervalMs * payload.readings.length + 50));
 
       const state = trafficController.getState();
-      const northLane = state.lanes.find((lane) => lane.id === 'north');
-      const westLane = state.lanes.find((lane) => lane.id === 'west');
+  const northLane = state.lanes.find((lane) => lane.id === 'north');
+  const southLane = state.lanes.find((lane) => lane.id === 'south');
 
-      expect(northLane?.lastDistanceCm).toBeCloseTo(11.2, 1);
-      expect(westLane?.lastDistanceCm).toBeCloseTo(25.7, 1);
+  expect(northLane?.lastDistanceCm).toBeCloseTo(11.2, 1);
+  expect(southLane?.lastDistanceCm).toBeCloseTo(25.7, 1);
     } finally {
       delete process.env.BATCH_SPREAD_WINDOW_MS;
     }
