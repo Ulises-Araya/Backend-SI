@@ -792,9 +792,9 @@ app.get('/api/analytics/overview', async (req, res) => {
   try {
     const [transitionCountsRaw, laneDurationsRaw, presenceSamplesRaw, greenTrendRaw] = await Promise.all([
       fetchPhaseTransitionCounts({ intersectionId }),
-      fetchLaneDurations({ intersectionId }),
-      fetchPresenceSamples({ intersectionId, limit: 400 }),
-      fetchGreenCycleTrend({ intersectionId, limit: 200 }),
+  fetchLaneDurations({ intersectionId, limit: 5_000 }),
+  fetchPresenceSamples({ intersectionId, limit: 2_000 }),
+  fetchGreenCycleTrend({ intersectionId, limit: 1_000 }),
     ]);
 
     const transitionCounts = transitionCountsRaw.map((row) => ({

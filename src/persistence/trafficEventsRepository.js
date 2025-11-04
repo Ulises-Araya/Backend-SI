@@ -210,7 +210,7 @@ async function fetchPhaseTransitionCounts({ intersectionId }) {
   return Array.from(counts.values());
 }
 
-async function fetchLaneDurations({ intersectionId, limit = 5_000 }) {
+async function fetchLaneDurations({ intersectionId, limit = 10_000 }) {
   const client = getClient();
   if (!client) {
     return [];
@@ -269,7 +269,7 @@ async function fetchLaneDurations({ intersectionId, limit = 5_000 }) {
   }));
 }
 
-async function fetchPresenceSamples({ intersectionId, limit = 300 }) {
+async function fetchPresenceSamples({ intersectionId, limit = 2_000 }) {
   const client = getClient();
   if (!client) {
     return [];
@@ -294,7 +294,7 @@ async function fetchPresenceSamples({ intersectionId, limit = 300 }) {
   return data ?? [];
 }
 
-async function fetchGreenCycleTrend({ intersectionId, limit = 200 }) {
+async function fetchGreenCycleTrend({ intersectionId, limit = 1_000 }) {
   const client = getClient();
   if (!client) {
     return [];
