@@ -148,6 +148,87 @@ describe('TrafficController', () => {
     expect(state.lanes.find((lane) => lane.id === 'north').state).not.toBe('green');
   });
 
+  test('forces phase change once maxGreenMs is reached even with vehicle present', () => {
+    const controller = new TrafficController({
+      ...baseConfig,
+      minGreenMs: 100,
+      maxGreenMs: 200,
+      yellowMs: 50,
+      detectionThresholdCm: 30,
+      vehiclePresenceGraceMs: 1_000,
+    });
+
+    const start = Date.now();
+    controller.reset(start);
+
+    controller.ingestEvent({
+      deviceId: 'esp32',
+      sensors: { sensor3: 10 },
+      timestamp: start + 50,
+      processedAt: start + 50,
+    });
+
+    controller.tick(start + 150);
+    let state = controller.getState();
+    expect(state.lanes.find((lane) => lane.id === 'north').state).toBe('green');
+
+    controller.ingestEvent({
+      deviceId: 'esp32',
+      sensors: { sensor3: 10 },
+      timestamp: start + 180,
+      processedAt: start + 180,
+    });
+
+    controller.tick(start + 220);
+    state = controller.getState();
+    expect(state.lanes.find((lane) => lane.id === 'north').state).not.toBe('green');
+  });
+
+  test('forces overdue lane to get green when red exceeds maxRedMs', () => {
+    const controller = new TrafficController({
+      ...baseConfig,
+      minGreenMs: 100,
+      maxGreenMs: 1_000,
+      maxRedMs: 200,
+      yellowMs: 50,
+      detectionThresholdCm: 30,
+      vehiclePresenceGraceMs: 1_000,
+    });
+
+    const start = Date.now();
+    controller.reset(start);
+
+    controller.ingestEvent({
+      deviceId: 'esp32',
+      sensors: { sensor3: 10 },
+      timestamp: start + 20,
+      processedAt: start + 20,
+    });
+
+    controller.ingestEvent({
+      deviceId: 'esp32',
+      sensors: { sensor2: 10 },
+      timestamp: start + 40,
+      processedAt: start + 40,
+    });
+
+    controller.tick(start + 150);
+    let state = controller.getState();
+    expect(state.lanes.find((lane) => lane.id === 'north').state).toBe('green');
+
+    controller.ingestEvent({
+      deviceId: 'esp32',
+      sensors: { sensor3: 10, sensor2: 10 },
+      timestamp: start + 180,
+      processedAt: start + 180,
+    });
+
+    controller.tick(start + 240);
+    state = controller.getState();
+    expect(state.lanes.find((lane) => lane.id === 'north').state).not.toBe('green');
+    expect(state.lanes.find((lane) => lane.id === 'south').state).not.toBe('red');
+  });
+
   test('ignores remaining minGreen once last vehicle cleared', () => {
     const controller = new TrafficController({
       ...baseConfig,

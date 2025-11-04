@@ -163,12 +163,24 @@ class TrafficController extends EventEmitter {
         const hadVehicleThisCycle =
           laneState.lastVehicleAt !== null && laneState.lastVehicleAt >= laneState.lastChangeAt;
         const canIgnoreMinGreen = hadVehicleThisCycle && !holdDueToVehicle;
+        const overdueLaneId = this._findOverdueLane(now, laneState.id);
+        const enforceMaxGreen = elapsed >= this.config.maxGreenMs;
+        const enforceMaxRed = Boolean(overdueLaneId) && elapsed >= this.config.minGreenMs;
+
+        if (enforceMaxGreen || enforceMaxRed) {
+          const next = this._chooseNextLane(laneState.id, now);
+          this.nextLaneId = next.laneId;
+          const changeReason = enforceMaxGreen ? 'max-green-elapsed' : 'max-red-overdue';
+          transitions.push(this._changeState(laneState.id, 'yellow', now, changeReason));
+          transitions.push(this._changeState(this.nextLaneId, 'red_yellow', now, 'preparing-for-green'));
+          break;
+        }
 
         if (elapsed < this.config.minGreenMs && !canIgnoreMinGreen) {
           break;
         }
 
-        if (holdDueToVehicle) {
+        if (holdDueToVehicle && !overdueLaneId) {
           break;
         }
 
