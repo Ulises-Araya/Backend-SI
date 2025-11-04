@@ -255,6 +255,18 @@ class TrafficController extends EventEmitter {
       laneState.redSince = null;
       if (laneState.presenceStartedAt !== null) {
         laneState.presenceTriggeredChange = true;
+        const detectedAt = laneState.presenceStartedAt;
+        const waitMs = Math.max(0, now - detectedAt);
+        this._recordPresenceEvent({
+          laneId,
+          detectedAt,
+          clearedAt: now,
+          waitMs,
+          triggeredChange: true,
+        });
+        laneState.presenceStartedAt = null;
+        laneState.presenceTriggeredChange = false;
+        laneState.lastClearedAt = now;
       }
     }
 
