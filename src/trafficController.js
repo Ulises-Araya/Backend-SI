@@ -30,6 +30,7 @@ class TrafficController extends EventEmitter {
     this.eventQueue = [];
     this._pendingPresenceEvents = [];
     this.nextLaneId = null;
+  this.nextLaneReason = null;
     this.reset();
   }
 
@@ -170,9 +171,11 @@ class TrafficController extends EventEmitter {
         if (enforceMaxGreen || enforceMaxRed) {
           const next = this._chooseNextLane(laneState.id, now);
           this.nextLaneId = next.laneId;
+          this.nextLaneReason = next.reason ?? null;
           const changeReason = enforceMaxGreen ? 'max-green-elapsed' : 'max-red-overdue';
+          const prepReason = this.nextLaneReason ? `prepare-${this.nextLaneReason}` : 'preparing-for-green';
           transitions.push(this._changeState(laneState.id, 'yellow', now, changeReason));
-          transitions.push(this._changeState(this.nextLaneId, 'red_yellow', now, 'preparing-for-green'));
+          transitions.push(this._changeState(this.nextLaneId, 'red_yellow', now, prepReason));
           break;
         }
 
@@ -186,16 +189,25 @@ class TrafficController extends EventEmitter {
 
         const next = this._chooseNextLane(laneState.id, now);
         this.nextLaneId = next.laneId;
-        transitions.push(this._changeState(laneState.id, 'yellow', now, 'min-green-elapsed'));
-        transitions.push(this._changeState(this.nextLaneId, 'red_yellow', now, 'preparing-for-green'));
+        this.nextLaneReason = next.reason ?? null;
+        const changeReason = this.nextLaneReason === 'queue'
+          ? 'queue'
+          : this.nextLaneReason === 'max-red'
+            ? 'max-red-overdue'
+            : 'min-green-elapsed';
+        const prepReason = this.nextLaneReason ? `prepare-${this.nextLaneReason}` : 'preparing-for-green';
+        transitions.push(this._changeState(laneState.id, 'yellow', now, changeReason));
+        transitions.push(this._changeState(this.nextLaneId, 'red_yellow', now, prepReason));
         break;
       }
       case 'yellow': {
         const elapsed = now - laneState.lastChangeAt;
         if (elapsed >= this.config.yellowMs) {
           transitions.push(this._changeState(laneState.id, 'red', now, 'yellow-elapsed'));
-          transitions.push(this._changeState(this.nextLaneId, 'green', now, 'yellow-elapsed'));
+          const reasonForGreen = this.nextLaneReason ?? 'yellow-elapsed';
+          transitions.push(this._changeState(this.nextLaneId, 'green', now, reasonForGreen));
           this.nextLaneId = null;
+          this.nextLaneReason = null;
         }
         break;
       }
@@ -388,6 +400,7 @@ class TrafficController extends EventEmitter {
 
     this.currentLaneId = this.config.lanes[0];
     this.nextLaneId = null;
+    this.nextLaneReason = null;
     this._pendingPresenceEvents = [];
 
     this.emit('state', this.getState());

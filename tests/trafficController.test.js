@@ -184,6 +184,45 @@ describe('TrafficController', () => {
     expect(state.lanes.find((lane) => lane.id === 'north').state).not.toBe('green');
   });
 
+  test('propagates queue reason when presence triggers phase change', () => {
+    const controller = new TrafficController({
+      ...baseConfig,
+      minGreenMs: 100,
+      maxGreenMs: 500,
+      yellowMs: 50,
+    });
+
+    const start = Date.now();
+    controller.reset(start);
+
+    controller.ingestEvent({
+      deviceId: 'esp32',
+      sensors: { sensor2: 10 },
+      timestamp: start + 20,
+      processedAt: start + 20,
+    });
+
+    const transitionsToYellow = controller.evaluateStateMachine(start + 150) || [];
+    const yellowChange = transitionsToYellow.find((change) => (
+      change &&
+      change.laneId === 'north' &&
+      change.previousState === 'green' &&
+      change.nextState === 'yellow'
+    ));
+
+    expect(yellowChange?.reason).toBe('queue');
+
+    const transitionsToGreen = controller.evaluateStateMachine(start + 210) || [];
+    const greenChange = transitionsToGreen.find((change) => (
+      change &&
+      change.laneId === 'south' &&
+      change.previousState === 'red_yellow' &&
+      change.nextState === 'green'
+    ));
+
+    expect(greenChange?.reason).toBe('queue');
+  });
+
   test('forces overdue lane to get green when red exceeds maxRedMs', () => {
     const controller = new TrafficController({
       ...baseConfig,
