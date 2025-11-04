@@ -304,8 +304,13 @@ describe('TrafficController', () => {
     expect(state.lanes.find((lane) => lane.id === 'north').state).toBe('yellow');
   });
 
-  test('removes lane from queue when sensor clears before turning green', () => {
-    const controller = new TrafficController(baseConfig);
+  test('removes lane from queue shortly after sensor clears before turning green', () => {
+    const controller = new TrafficController({
+      ...baseConfig,
+      presenceTimeoutMs: 400,
+      holdAfterClearMs: 120,
+      vehiclePresenceGraceMs: 150,
+    });
     const now = Date.now();
 
     controller.ingestEvent({
@@ -323,6 +328,16 @@ describe('TrafficController', () => {
       sensors: { sensor4: 999 },
       timestamp: now + 100,
       processedAt: now + 100,
+    });
+
+    state = controller.getState();
+    expect(state.queue).toContain('west');
+
+    controller.ingestEvent({
+      deviceId: 'esp32',
+      sensors: { sensor4: 999 },
+      timestamp: now + 450,
+      processedAt: now + 450,
     });
 
     state = controller.getState();

@@ -128,10 +128,15 @@ class TrafficController extends EventEmitter {
           laneState.presenceTriggeredChange = false;
         }
 
-        if (laneState.waiting && laneState.state !== 'green') {
-          this._removeFromQueue(laneId);
-        } else if (laneState.waiting && laneState.lastVehicleAt && now - laneState.lastVehicleAt > this.config.presenceTimeoutMs) {
-          this._removeFromQueue(laneId);
+        if (laneState.waiting && laneState.lastVehicleAt) {
+          const absenceThreshold = Math.min(
+            this.config.presenceTimeoutMs,
+            this.config.holdAfterClearMs + this.config.vehiclePresenceGraceMs,
+          );
+          const absenceDuration = now - laneState.lastVehicleAt;
+          if (absenceDuration >= absenceThreshold) {
+            this._removeFromQueue(laneId);
+          }
         }
       }
     });
