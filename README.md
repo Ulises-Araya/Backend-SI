@@ -211,3 +211,6 @@ El backend encola cada lectura del lote y las ejecuta en segundo plano dentro de
 - Añadir autenticación por token para filtrar quién puede enviar datos al backend.
 - Notificar cambios de fase mediante MQTT u otro canal push a un frontend en tiempo real.
 - Incorporar lógica adicional (peatones, horarios pico, prioridad a transporte público, etc.).
+
+## Link a la pagina desplegada
+- https://frontend-si-ten.vercel.app/
