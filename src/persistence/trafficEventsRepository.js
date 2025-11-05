@@ -4,24 +4,9 @@ const TABLE_TRAFFIC_EVENTS = (process.env.SUPABASE_TRAFFIC_EVENTS_TABLE || '').t
 const TABLE_PHASE_CHANGES = process.env.SUPABASE_PHASE_CHANGES_TABLE || 'traffic_phase_changes';
 const TABLE_PRESENCE_EVENTS = process.env.SUPABASE_PRESENCE_EVENTS_TABLE || 'traffic_presence_events';
 const TABLE_EVENTS_SUMMARY = process.env.SUPABASE_EVENTS_SUMMARY_TABLE || 'traffic_events_summary';
+const TABLE_LANES = process.env.SUPABASE_LANES_TABLE || 'lanes';
 const DISABLE_SUPABASE = process.env.DISABLE_SUPABASE === 'true';
-
-function isAggregateNotAllowed(error) {
-  if (!error) {
-    return false;
-  }
-
-  const message = String(error.message || '').toLowerCase();
-  if (error.code === 'PGRST123') {
-    return true;
-  }
-
-  if (error.code === 'PGRST200' && /sum|count/.test(message)) {
-    return true;
-  }
-
-  return message.includes('aggregate');
-}
+const DEFAULT_LANE_KEYS = ['north', 'south', 'east', 'west'];
 
 async function persistTrafficEvent(event) {
   if (DISABLE_SUPABASE) {
@@ -151,85 +136,81 @@ async function persistTrafficSummary(summary) {
   return { persisted: true };
 }
 
+async function resolveLaneKeys(client, intersectionId) {
+  if (!client || DISABLE_SUPABASE) {
+    return [...DEFAULT_LANE_KEYS];
+  }
+
+  if (!intersectionId) {
+    return [...DEFAULT_LANE_KEYS];
+  }
+
+  try {
+    const { data, error } = await client
+      .from(TABLE_LANES)
+      .select('lane_key', { head: false })
+      .eq('intersection_id', intersectionId)
+      .order('lane_key', { ascending: true });
+
+    if (!error && Array.isArray(data) && data.length > 0) {
+      const unique = new Set();
+      data.forEach((row) => {
+        if (row?.lane_key) {
+          unique.add(row.lane_key);
+        }
+      });
+      if (unique.size > 0) {
+        return Array.from(unique);
+      }
+    }
+  } catch (laneError) {
+    console.warn('[supabase] No se pudieron obtener los carriles para la intersección:', laneError);
+  }
+
+  return [...DEFAULT_LANE_KEYS];
+}
+
 async function fetchPhaseTransitionCounts({ intersectionId }) {
   const client = getClient();
   if (!client) {
     return [];
   }
 
-  const rpcArgs = {};
-  if (intersectionId) {
-    rpcArgs.intersection_uuid = intersectionId;
-  }
+  const laneKeys = await resolveLaneKeys(client, intersectionId);
+  const targets = laneKeys.map((laneKey) => ({ laneKey, nextState: 'green' }));
 
-  try {
-    const { data: rpcData, error: rpcError } = await client.rpc('get_phase_transition_counts', rpcArgs);
-    if (!rpcError && Array.isArray(rpcData)) {
-      return rpcData.map((row) => ({
-        lane_key: row.lane_key,
-        next_state: row.next_state,
-        count: Number(row.transition_count) || 0,
-      }));
-    }
+  const results = await Promise.all(
+    targets.map(async ({ laneKey, nextState }) => {
+      try {
+        let query = client
+          .from(TABLE_PHASE_CHANGES)
+          .select('id', { count: 'exact', head: true })
+          .eq('lane_key', laneKey)
+          .eq('next_state', nextState);
 
-    if (rpcError && !/function get_phase_transition_counts/i.test(String(rpcError.message))) {
-      console.warn('[supabase] RPC get_phase_transition_counts failed, fallback to REST query:', rpcError);
-    }
-  } catch (rpcException) {
-    console.warn('[supabase] RPC get_phase_transition_counts threw, fallback to REST query:', rpcException);
-  }
+        if (intersectionId) {
+          query = query.eq('intersection_id', intersectionId);
+        }
 
-  let builder = client
-    .from(TABLE_PHASE_CHANGES)
-    .select('lane_key,next_state,count:count()', { head: false, group: 'lane_key,next_state' })
-    .neq('next_state', null);
+        const { count, error } = await query;
+        if (error) {
+          console.error('[supabase] Error contando cambios de fase:', { laneKey, nextState, error });
+          return null;
+        }
 
-  if (intersectionId) {
-    builder = builder.eq('intersection_id', intersectionId);
-  }
+        return {
+          lane_key: laneKey,
+          next_state: nextState,
+          count: Number(count) || 0,
+        };
+      } catch (error) {
+        console.error('[supabase] Error inesperado contando cambios de fase:', { laneKey, nextState, error });
+        return null;
+      }
+    }),
+  );
 
-  const { data, error } = await builder;
-  if (!error) {
-    return data ?? [];
-  }
-
-  if (!isAggregateNotAllowed(error)) {
-    console.error('[supabase] Error consultando cambios de fase:', error);
-    return [];
-  }
-
-  let fallbackBuilder = client
-    .from(TABLE_PHASE_CHANGES)
-    .select('lane_key,next_state', { head: false })
-    .neq('next_state', null)
-    .order('ended_at', { ascending: false })
-    .limit(5_000);
-
-  if (intersectionId) {
-    fallbackBuilder = fallbackBuilder.eq('intersection_id', intersectionId);
-  }
-
-  const { data: fallbackRows, error: fallbackError } = await fallbackBuilder;
-  if (fallbackError) {
-    console.error('[supabase] Error consultando cambios de fase (fallback):', fallbackError);
-    return [];
-  }
-
-  const counts = new Map();
-
-  (fallbackRows ?? []).forEach((row) => {
-    const laneKey = row.lane_key;
-    const nextState = row.next_state;
-    if (!laneKey || !nextState) {
-      return;
-    }
-    const hash = `${laneKey}::${nextState}`;
-    const current = counts.get(hash) || { lane_key: laneKey, next_state: nextState, count: 0 };
-    current.count += 1;
-    counts.set(hash, current);
-  });
-
-  return Array.from(counts.values());
+  return results.filter(Boolean);
 }
 
 async function fetchLaneDurations({ intersectionId, limit = 10_000 }) {

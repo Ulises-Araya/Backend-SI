@@ -129,31 +129,6 @@ create index
 if not exists idx_presence_events_intersection_detected on public.traffic_presence_events
 (intersection_id, detected_at);
 
-create or replace function public.get_phase_transition_counts
-(intersection_uuid uuid default null)
-returns table
-(
-  lane_key text,
-  next_state text,
-  transition_count bigint
-)
-language sql
-stable
-as
-$$
-select
-  lane_key,
-  next_state,
-  count(*)
-::bigint as transition_count
-  from public.traffic_phase_changes
-  where next_state is not null
-    and
-(intersection_uuid is null or intersection_id = intersection_uuid)
-  group by lane_key, next_state
-  order by lane_key, next_state;
-$$;
-
 -- Campos extendidos para catálogo de intersecciones
 alter table
 if exists public.intersections
