@@ -31,153 +31,283 @@ const GREEN_TREND_BUCKET_MS = Number(process.env.GREEN_TREND_BUCKET_MS ?? 10_000
 const ESP32_HEARTBEAT_TIMEOUT_MS = Number(process.env.ESP32_HEARTBEAT_TIMEOUT_MS ?? 15_000) || 15_000;
 const IS_TEST_ENV = process.env.NODE_ENV === 'test';
 
-const MAX_IN_MEMORY_PHASE_CHANGES = 10_000;
-const MAX_IN_MEMORY_PRESENCE_EVENTS = 5_000;
-const inMemoryPhaseChanges = [];
-const inMemoryPresenceEvents = [];
+const MAX_PRESENCE_EVENTS = 2_000;
+const GREEN_TREND_MEMORY_LIMIT = 500;
 
-function trimBuffer(buffer, maxSize) {
-  if (buffer.length > maxSize) {
-    buffer.splice(0, buffer.length - maxSize);
+const memoryAnalytics = {
+  lanes: new Map(),
+  presenceEvents: [],
+  greenTrendBuckets: new Map(),
+};
+
+function getConfiguredLaneKeys() {
+  const lanes = trafficController?.config?.lanes;
+  return Array.isArray(lanes) ? lanes : [];
+}
+
+function ensureLaneEntry(laneKey) {
+  if (!laneKey) {
+    return null;
+  }
+  if (!memoryAnalytics.lanes.has(laneKey)) {
+    memoryAnalytics.lanes.set(laneKey, {
+      laneKey,
+      greenTransitions: 0,
+      greenTotalMs: 0,
+      greenCount: 0,
+      redTotalMs: 0,
+      redCount: 0,
+    });
+  }
+  return memoryAnalytics.lanes.get(laneKey);
+}
+
+function trimOldPresenceEvents() {
+  const { presenceEvents } = memoryAnalytics;
+  if (presenceEvents.length > MAX_PRESENCE_EVENTS) {
+    presenceEvents.splice(0, presenceEvents.length - MAX_PRESENCE_EVENTS);
   }
 }
 
-function recordPhaseChanges(changes = []) {
-  if (!Array.isArray(changes) || changes.length === 0) {
+function trimTrendBuckets() {
+  const keys = Array.from(memoryAnalytics.greenTrendBuckets.keys()).sort();
+  while (memoryAnalytics.greenTrendBuckets.size > GREEN_TREND_MEMORY_LIMIT) {
+    const oldest = keys.shift();
+    if (typeof oldest === 'string') {
+      memoryAnalytics.greenTrendBuckets.delete(oldest);
+    } else {
+      break;
+    }
+  }
+}
+
+function registerPhaseChangeForMemory(change) {
+  if (!change) {
     return;
   }
-  changes.forEach((change) => {
-    if (!change) {
-      return;
-    }
-    inMemoryPhaseChanges.push({ ...change });
-  });
-  trimBuffer(inMemoryPhaseChanges, MAX_IN_MEMORY_PHASE_CHANGES);
-}
-
-function recordPresenceEvents(events = []) {
-  if (!Array.isArray(events) || events.length === 0) {
+  const laneKey = change.laneId || change.lane_key || change.laneKey;
+  const duration = Number(change.durationMs);
+  if (!laneKey || !Number.isFinite(duration) || duration < 0) {
     return;
   }
-  events.forEach((event) => {
-    if (!event) {
-      return;
-    }
-    inMemoryPresenceEvents.push({ ...event });
-  });
-  trimBuffer(inMemoryPresenceEvents, MAX_IN_MEMORY_PRESENCE_EVENTS);
-}
 
-function resolveLaneKey(entry) {
-  return entry?.laneId || entry?.laneKey || null;
-}
-
-function computeTransitionCountsFromMemory() {
-  const counts = new Map();
-  inMemoryPhaseChanges.forEach((change) => {
-    const laneKey = resolveLaneKey(change);
-    if (!laneKey) {
-      return;
-    }
-    if (change.previousState === 'red' && change.nextState === 'green') {
-      counts.set(laneKey, (counts.get(laneKey) ?? 0) + 1);
-    }
-  });
-
-  return Array.from(counts.entries())
-    .map(([laneKey, count]) => ({ laneKey, toState: 'green', count }))
-    .sort((a, b) => a.laneKey.localeCompare(b.laneKey));
-}
-
-function computeLaneDurationsFromMemory() {
-  const byLane = new Map();
-
-  inMemoryPhaseChanges.forEach((change) => {
-    const laneKey = resolveLaneKey(change);
-    const duration = Number(change?.durationMs);
-    if (!laneKey || !Number.isFinite(duration) || duration <= 0) {
-      return;
-    }
-
-    if (!byLane.has(laneKey)) {
-      byLane.set(laneKey, {
-        laneKey,
-        greenTotal: 0,
-        greenCount: 0,
-        redTotal: 0,
-        redCount: 0,
-      });
-    }
-
-    const accumulator = byLane.get(laneKey);
-    if (change.previousState === 'green' && change.nextState === 'red') {
-      accumulator.greenTotal += duration;
-      accumulator.greenCount += 1;
-    } else if (change.previousState === 'red' && change.nextState === 'green') {
-      accumulator.redTotal += duration;
-      accumulator.redCount += 1;
-    }
-  });
-
-  return Array.from(byLane.values()).map((entry) => ({
-    laneKey: entry.laneKey,
-    greenMs: entry.greenCount > 0 ? entry.greenTotal / entry.greenCount : 0,
-    redMs: entry.redCount > 0 ? entry.redTotal / entry.redCount : 0,
-  }));
-}
-
-function computePresenceSamplesFromMemory(limit = 2_000) {
-  if (inMemoryPresenceEvents.length === 0) {
-    return [];
+  const entry = ensureLaneEntry(laneKey);
+  if (!entry) {
+    return;
   }
 
-  const slice = inMemoryPresenceEvents.slice(-limit);
-  return slice.map((event) => {
-    const laneKey = resolveLaneKey(event);
-    const detectedAt = typeof event.detectedAt === 'number'
-      ? new Date(event.detectedAt).toISOString()
-      : event.detectedAt;
+  if (change.previousState === 'red' && (change.nextState === 'red_yellow' || change.nextState === 'green')) {
+    entry.redTotalMs += duration;
+    entry.redCount += 1;
+  }
+
+  if (change.previousState === 'green' && (change.nextState === 'yellow' || change.nextState === 'red')) {
+    entry.greenTotalMs += duration;
+    entry.greenCount += 1;
+
+    const endedAt = Number(change.endedAt ?? Date.now());
+    if (Number.isFinite(endedAt)) {
+      const aligned = Math.floor(endedAt / GREEN_TREND_BUCKET_MS) * GREEN_TREND_BUCKET_MS;
+      const bucketKey = new Date(aligned).toISOString();
+      if (!memoryAnalytics.greenTrendBuckets.has(bucketKey)) {
+        memoryAnalytics.greenTrendBuckets.set(bucketKey, { bucket: bucketKey, totalMs: 0, count: 0 });
+      }
+      const bucket = memoryAnalytics.greenTrendBuckets.get(bucketKey);
+      bucket.totalMs += duration;
+      bucket.count += 1;
+      trimTrendBuckets();
+    }
+  }
+
+  if (
+    (change.previousState === 'red_yellow' && change.nextState === 'green') ||
+    (change.previousState === 'red' && change.nextState === 'green')
+  ) {
+    entry.greenTransitions += 1;
+  }
+}
+
+function registerPresenceEventForMemory(event) {
+  if (!event) {
+    return;
+  }
+  const laneKey = event.laneId || event.lane_key || event.laneKey || 'unknown';
+  const waitMs = Number(event.waitMs);
+  const detectedAtRaw = event.detectedAt ?? event.detected_at ?? event.startedAt ?? event.clearedAt;
+  let detectedAt = null;
+  if (typeof detectedAtRaw === 'number') {
+    detectedAt = new Date(detectedAtRaw).toISOString();
+  } else if (typeof detectedAtRaw === 'string') {
+    detectedAt = detectedAtRaw;
+  } else {
+    detectedAt = new Date().toISOString();
+  }
+
+  memoryAnalytics.presenceEvents.push({
+    laneKey,
+    waitMs: Number.isFinite(waitMs) ? waitMs : 0,
+    detectedAt,
+  });
+  trimOldPresenceEvents();
+}
+
+function getAnalyticsFromMemory() {
+  const laneKeys = getConfiguredLaneKeys();
+  const transitionCounts = [];
+  const laneDurations = [];
+  const seenLanes = new Set();
+
+  memoryAnalytics.lanes.forEach((entry, laneKey) => {
+    seenLanes.add(laneKey);
+    transitionCounts.push({ laneKey, toState: 'green', count: entry.greenTransitions });
+    laneDurations.push({
+      laneKey,
+      greenMs: entry.greenCount > 0 ? entry.greenTotalMs / entry.greenCount : 0,
+      redMs: entry.redCount > 0 ? entry.redTotalMs / entry.redCount : 0,
+    });
+  });
+
+  laneKeys.forEach((laneKey) => {
+    if (!seenLanes.has(laneKey)) {
+      transitionCounts.push({ laneKey, toState: 'green', count: 0 });
+      laneDurations.push({ laneKey, greenMs: 0, redMs: 0 });
+    }
+  });
+
+  transitionCounts.sort((a, b) => a.laneKey.localeCompare(b.laneKey));
+  laneDurations.sort((a, b) => a.laneKey.localeCompare(b.laneKey));
+
+  const greenShare = laneDurations.map((row) => {
+    const total = row.greenMs + row.redMs;
     return {
-      laneKey: laneKey ?? 'unknown',
-      waitMs: Number(event.waitMs) || 0,
-      detectedAt,
+      laneKey: row.laneKey,
+      greenRatio: total > 0 ? row.greenMs / total : 0,
     };
   });
-}
 
-function computeGreenTrendFromMemory(bucketSizeMs = GREEN_TREND_BUCKET_MS) {
-  if (!inMemoryPhaseChanges.length) {
-    return [];
-  }
+  const presenceSamples = memoryAnalytics.presenceEvents.slice(-MAX_PRESENCE_EVENTS);
 
-  const buckets = new Map();
-
-  inMemoryPhaseChanges.forEach((change) => {
-    if (change.previousState !== 'green' || change.nextState !== 'red') {
-      return;
-    }
-    const endedAt = Number(change.endedAt ?? Date.now());
-    if (!Number.isFinite(endedAt)) {
-      return;
-    }
-    const aligned = Math.floor(endedAt / bucketSizeMs) * bucketSizeMs;
-    const key = new Date(aligned).toISOString();
-    if (!buckets.has(key)) {
-      buckets.set(key, { bucket: key, totalMs: 0, count: 0 });
-    }
-    const bucket = buckets.get(key);
-    bucket.totalMs += Number(change.durationMs) || 0;
-    bucket.count += 1;
-  });
-
-  return Array.from(buckets.values())
+  const greenCycleTrend = Array.from(memoryAnalytics.greenTrendBuckets.values())
     .sort((a, b) => (a.bucket < b.bucket ? -1 : a.bucket > b.bucket ? 1 : 0))
     .map((entry) => ({
       bucket: entry.bucket,
       avgGreenMs: entry.count > 0 ? entry.totalMs / entry.count : 0,
       sampleCount: entry.count,
     }));
+
+  return { transitionCounts, laneDurations, greenShare, presenceSamples, greenCycleTrend };
 }
+
+function mergeTransitionCounts(primary = [], fallback = []) {
+  const merged = Array.isArray(primary) ? primary.map((item) => ({
+    laneKey: item.laneKey ?? item.lane_key,
+    toState: item.toState ?? item.next_state ?? 'green',
+    count: Number(item.count) || 0,
+  })) : [];
+
+  const index = new Map();
+  merged.forEach((item, position) => {
+    const key = `${item.laneKey ?? 'unknown'}::${item.toState ?? 'green'}`;
+    index.set(key, position);
+  });
+
+  fallback.forEach((item) => {
+    const laneKey = item.laneKey ?? item.lane_key;
+    const toState = item.toState ?? item.next_state ?? 'green';
+    if (!laneKey) {
+      return;
+    }
+    const key = `${laneKey}::${toState}`;
+    const count = Number(item.count) || 0;
+    if (index.has(key)) {
+      const position = index.get(key);
+      const current = merged[position];
+      merged[position] = {
+        laneKey,
+        toState,
+        count: Math.max(Number(current.count) || 0, count),
+      };
+    } else {
+      index.set(key, merged.length);
+      merged.push({ laneKey, toState, count });
+    }
+  });
+
+  getConfiguredLaneKeys().forEach((laneKey) => {
+    const key = `${laneKey}::green`;
+    if (!index.has(key)) {
+      index.set(key, merged.length);
+      merged.push({ laneKey, toState: 'green', count: 0 });
+    }
+  });
+
+  return merged;
+}
+
+function mergeLaneDurations(primary = [], fallback = []) {
+  const map = new Map();
+
+  fallback.forEach((item) => {
+    const laneKey = item.laneKey ?? item.lane_key;
+    if (!laneKey) {
+      return;
+    }
+    map.set(laneKey, {
+      laneKey,
+      greenMs: Number(item.greenMs ?? item.green_ms) || 0,
+      redMs: Number(item.redMs ?? item.red_ms) || 0,
+    });
+  });
+
+  primary.forEach((item) => {
+    const laneKey = item.laneKey ?? item.lane_key;
+    if (!laneKey) {
+      return;
+    }
+    map.set(laneKey, {
+      laneKey,
+      greenMs: Number(item.greenMs ?? item.green_ms) || 0,
+      redMs: Number(item.redMs ?? item.red_ms) || 0,
+    });
+  });
+
+  getConfiguredLaneKeys().forEach((laneKey) => {
+    if (!map.has(laneKey)) {
+      map.set(laneKey, { laneKey, greenMs: 0, redMs: 0 });
+    }
+  });
+
+  return Array.from(map.values()).sort((a, b) => a.laneKey.localeCompare(b.laneKey));
+}
+
+function mergePresenceSamples(primary = [], fallback = []) {
+  if (Array.isArray(primary) && primary.length > 0) {
+    return primary.map((row) => ({
+      laneKey: row.laneKey ?? row.lane_key ?? 'unknown',
+      waitMs: Number(row.waitMs ?? row.wait_ms) || 0,
+      detectedAt: row.detectedAt ?? row.detected_at ?? new Date().toISOString(),
+    }));
+  }
+  return Array.isArray(fallback) ? fallback.slice() : [];
+}
+
+function mergeGreenTrend(primary = [], fallback = []) {
+  if (Array.isArray(primary) && primary.length > 0) {
+    return primary.map((entry) => {
+      const avg = Number(entry.avgGreenMs ?? entry.avg_green_ms);
+      const count = Number(entry.sampleCount ?? entry.sample_count ?? entry.count);
+      return {
+        bucket: entry.bucket,
+        avgGreenMs: Number.isFinite(avg) ? avg : 0,
+        sampleCount: Number.isFinite(count) ? count : 0,
+      };
+    }).sort((a, b) => (a.bucket < b.bucket ? -1 : a.bucket > b.bucket ? 1 : 0));
+  }
+  return Array.isArray(fallback) ? fallback.slice().sort((a, b) => (a.bucket < b.bucket ? -1 : a.bucket > b.bucket ? 1 : 0)) : [];
+}
+
+trafficController.on('phase-change', registerPhaseChangeForMemory);
+trafficController.on('presence-event', registerPresenceEventForMemory);
 
 // Estado de conexiones
 let databaseConnected = false;
@@ -284,7 +414,6 @@ const trafficTickTimer = IS_TEST_ENV
     
   const transitions = trafficController.tick();
   const phaseChanges = collapsePhaseChanges(transitions);
-  recordPhaseChanges(phaseChanges);
     if (phaseChanges.length) {
       console.debug('[traffic] transitions', phaseChanges);
 
@@ -433,9 +562,7 @@ async function processTrafficEvent(payload = {}, context = {}) {
       ? result.evaluation.filter((item) => item && item.type === 'phase-change')
       : [],
   );
-  recordPhaseChanges(phaseChanges);
   const presenceEvents = Array.isArray(result?.presenceEvents) ? result.presenceEvents : [];
-  recordPresenceEvents(presenceEvents);
 
   const receivedAt = new Date().toISOString();
   const eventId = randomUUID();
@@ -948,25 +1075,21 @@ app.get('/api/analytics/overview', async (req, res) => {
   fetchGreenCycleTrend({ intersectionId, limit: 1_000 }),
     ]);
 
-    let transitionCounts = transitionCountsRaw.map((row) => ({
+    const memorySnapshot = getAnalyticsFromMemory();
+
+    const transitionCountsDb = transitionCountsRaw.map((row) => ({
       laneKey: row.lane_key,
       toState: row.next_state,
       count: Number(row.count) || 0,
     }));
+    const transitionCounts = mergeTransitionCounts(transitionCountsDb, memorySnapshot.transitionCounts);
 
-    if (transitionCounts.length === 0) {
-      transitionCounts = computeTransitionCountsFromMemory();
-    }
-
-    let laneDurations = laneDurationsRaw.map((row) => ({
+    const laneDurationsDb = laneDurationsRaw.map((row) => ({
       laneKey: row.laneKey ?? row.lane_key,
       greenMs: Number(row.greenMs ?? row.green_ms) || 0,
       redMs: Number(row.redMs ?? row.red_ms) || 0,
     }));
-
-    if (laneDurations.length === 0) {
-      laneDurations = computeLaneDurationsFromMemory();
-    }
+    const laneDurations = mergeLaneDurations(laneDurationsDb, memorySnapshot.laneDurations);
 
     const greenShare = laneDurations.map((row) => {
       const total = row.greenMs + row.redMs;
@@ -976,15 +1099,12 @@ app.get('/api/analytics/overview', async (req, res) => {
       };
     });
 
-    let presenceSamples = presenceSamplesRaw.map((row) => ({
+    const presenceSamplesDb = presenceSamplesRaw.map((row) => ({
       laneKey: row.lane_key,
       waitMs: Number(row.wait_ms) || 0,
       detectedAt: row.detected_at,
     }));
-
-    if (presenceSamples.length === 0) {
-      presenceSamples = computePresenceSamplesFromMemory();
-    }
+    const presenceSamples = mergePresenceSamples(presenceSamplesDb, memorySnapshot.presenceSamples);
 
     const trendBuckets = new Map();
     greenTrendRaw.forEach((row) => {
@@ -1005,17 +1125,14 @@ app.get('/api/analytics/overview', async (req, res) => {
       bucket.count += 1;
     });
 
-    let greenCycleTrend = Array.from(trendBuckets.values())
+    const greenCycleTrendDb = Array.from(trendBuckets.values())
       .sort((a, b) => (a.bucket < b.bucket ? -1 : a.bucket > b.bucket ? 1 : 0))
       .map((entry) => ({
         bucket: entry.bucket,
         avgGreenMs: entry.count > 0 ? entry.totalMs / entry.count : 0,
         sampleCount: entry.count,
       }));
-
-    if (greenCycleTrend.length === 0) {
-      greenCycleTrend = computeGreenTrendFromMemory();
-    }
+    const greenCycleTrend = mergeGreenTrend(greenCycleTrendDb, memorySnapshot.greenCycleTrend);
 
     res.json({
       intersectionId,

@@ -240,12 +240,12 @@ class TrafficController extends EventEmitter {
       return null;
     }
 
-    const previousState = laneState.state;
-    const startedAt = laneState.lastChangeAt;
-    const durationMs = Math.max(0, now - startedAt);
+  const previousState = laneState.state;
+  const startedAt = laneState.lastChangeAt;
+  const durationMs = Math.max(0, now - startedAt);
 
-    laneState.state = nextState;
-    laneState.lastChangeAt = now;
+  laneState.state = nextState;
+  laneState.lastChangeAt = now;
 
     if (nextState === 'green') {
       this.currentLaneId = laneId;
@@ -278,7 +278,7 @@ class TrafficController extends EventEmitter {
       laneState.waiting = false;
     }
 
-    return {
+    const change = {
       type: 'phase-change',
       laneId,
       previousState,
@@ -288,6 +288,8 @@ class TrafficController extends EventEmitter {
       durationMs,
       reason,
     };
+    this.emit('phase-change', change);
+    return change;
   }
 
   _chooseNextLane(currentLaneId, now) {
@@ -353,7 +355,9 @@ class TrafficController extends EventEmitter {
     if (!Array.isArray(this._pendingPresenceEvents)) {
       this._pendingPresenceEvents = [];
     }
-    this._pendingPresenceEvents.push({ ...event });
+    const snapshot = { ...event };
+    this._pendingPresenceEvents.push(snapshot);
+    this.emit('presence-event', snapshot);
   }
 
   getState(options = {}) {
