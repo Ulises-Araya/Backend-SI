@@ -213,4 +213,4 @@ El backend encola cada lectura del lote y las ejecuta en segundo plano dentro de
 - Incorporar lógica adicional (peatones, horarios pico, prioridad a transporte público, etc.).
 
 ## Link a la pagina desplegada
-- https://frontend-si-ten.vercel.app/
+- https://frontend-si-ten.vercel.app/ 
