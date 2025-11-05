@@ -264,11 +264,20 @@ function mergeLaneDurations(primary = [], fallback = []) {
     if (!laneKey) {
       return;
     }
-    map.set(laneKey, {
+    const fromPrimary = {
       laneKey,
       greenMs: Number(item.greenMs ?? item.green_ms) || 0,
       redMs: Number(item.redMs ?? item.red_ms) || 0,
-    });
+    };
+    const existing = map.get(laneKey);
+    if (!existing) {
+      map.set(laneKey, fromPrimary);
+      return;
+    }
+    const hasFallbackData = (existing.greenMs ?? 0) > 0 || (existing.redMs ?? 0) > 0;
+    if (!hasFallbackData && ((fromPrimary.greenMs ?? 0) > 0 || (fromPrimary.redMs ?? 0) > 0)) {
+      map.set(laneKey, fromPrimary);
+    }
   });
 
   getConfiguredLaneKeys().forEach((laneKey) => {
