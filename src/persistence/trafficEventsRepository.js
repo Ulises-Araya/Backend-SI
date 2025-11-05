@@ -157,6 +157,28 @@ async function fetchPhaseTransitionCounts({ intersectionId }) {
     return [];
   }
 
+  const rpcArgs = {};
+  if (intersectionId) {
+    rpcArgs.intersection_uuid = intersectionId;
+  }
+
+  try {
+    const { data: rpcData, error: rpcError } = await client.rpc('get_phase_transition_counts', rpcArgs);
+    if (!rpcError && Array.isArray(rpcData)) {
+      return rpcData.map((row) => ({
+        lane_key: row.lane_key,
+        next_state: row.next_state,
+        count: Number(row.transition_count) || 0,
+      }));
+    }
+
+    if (rpcError && !/function get_phase_transition_counts/i.test(String(rpcError.message))) {
+      console.warn('[supabase] RPC get_phase_transition_counts failed, fallback to REST query:', rpcError);
+    }
+  } catch (rpcException) {
+    console.warn('[supabase] RPC get_phase_transition_counts threw, fallback to REST query:', rpcException);
+  }
+
   let builder = client
     .from(TABLE_PHASE_CHANGES)
     .select('lane_key,next_state,count:count()', { head: false, group: 'lane_key,next_state' })
@@ -304,7 +326,8 @@ async function fetchGreenCycleTrend({ intersectionId, limit = 1_000 }) {
     .from(TABLE_PHASE_CHANGES)
     .select('lane_key,ended_at,duration_ms', { head: false })
     .eq('previous_state', 'green')
-    .eq('next_state', 'red')
+    .in('next_state', ['yellow', 'red'])
+    .gt('duration_ms', 0)
     .order('ended_at', { ascending: false })
     .limit(limit);
 
