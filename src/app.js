@@ -13,6 +13,7 @@ const {
   fetchLaneDurations,
   fetchPresenceSamples,
   fetchGreenCycleTrend,
+  fetchTotalTransitionsCount,
 } = require('./persistence/trafficEventsRepository');
 const {
   INTERSECTION_STATUSES,
@@ -1167,11 +1168,12 @@ app.get('/api/analytics/overview', async (req, res) => {
     const intersectionIdForQueries = resolvedIntersectionId ?? undefined;
     const intersectionIdForResponse = resolvedIntersectionId ?? requestedIntersectionId ?? DEFAULT_INTERSECTION_ID;
 
-    const [transitionCountsRaw, laneDurationsRaw, presenceSamplesRaw, greenTrendRaw] = await Promise.all([
+    const [transitionCountsRaw, laneDurationsRaw, presenceSamplesRaw, greenTrendRaw, totalTransitionsDb] = await Promise.all([
       fetchPhaseTransitionCounts({ intersectionId: intersectionIdForQueries }),
       fetchLaneDurations({ intersectionId: intersectionIdForQueries, limit: 5_000 }),
       fetchPresenceSamples({ intersectionId: intersectionIdForQueries, limit: 2_000 }),
       fetchGreenCycleTrend({ intersectionId: intersectionIdForQueries, limit: 1_000 }),
+      fetchTotalTransitionsCount({ intersectionId: intersectionIdForQueries }),
     ]);
 
     const memorySnapshot = getAnalyticsFromMemory();
@@ -1234,6 +1236,11 @@ app.get('/api/analytics/overview', async (req, res) => {
       }));
     const greenCycleTrend = mergeGreenTrend(greenCycleTrendDb, memorySnapshot.greenCycleTrend);
 
+    const totalTransitionsFromCounts = transitionCounts
+      .filter((row) => row.toState === 'green')
+      .reduce((sum, row) => sum + (Number(row.count) || 0), 0);
+    const totalTransitions = Math.max(Number(totalTransitionsDb) || 0, totalTransitionsFromCounts);
+
     res.json({
       intersectionId: intersectionIdForResponse,
       transitionCounts,
@@ -1241,6 +1248,9 @@ app.get('/api/analytics/overview', async (req, res) => {
       greenShare,
       presenceSamples,
       greenCycleTrend,
+      totals: {
+        transitions: totalTransitions,
+      },
     });
   } catch (error) {
     console.error('[analytics] No se pudo obtener overview:', error);
