@@ -25,7 +25,9 @@ const {
 const trafficController = new TrafficController();
 const sseClients = new Set();
 const TICK_INTERVAL_MS = Number(process.env.TICK_INTERVAL_MS ?? 250) || 250;
-const DEFAULT_INTERSECTION_ID = process.env.DEFAULT_INTERSECTION_ID ?? 'default';
+const DEFAULT_INTERSECTION_ID = typeof process.env.DEFAULT_INTERSECTION_ID === 'string' && process.env.DEFAULT_INTERSECTION_ID.trim()
+  ? process.env.DEFAULT_INTERSECTION_ID.trim()
+  : 'default';
 const SYSTEM_DEVICE_ID = process.env.SYSTEM_DEVICE_ID ?? null;
 const GREEN_TREND_BUCKET_MS = Number(process.env.GREEN_TREND_BUCKET_MS ?? 10_000) || 10_000;
 const ESP32_HEARTBEAT_TIMEOUT_MS = Number(process.env.ESP32_HEARTBEAT_TIMEOUT_MS ?? 15_000) || 15_000;
@@ -40,9 +42,64 @@ const memoryAnalytics = {
   greenTrendBuckets: new Map(),
 };
 
+let cachedDefaultIntersectionId = DEFAULT_INTERSECTION_ID !== 'default' ? DEFAULT_INTERSECTION_ID : null;
+let resolvingDefaultIntersectionIdPromise = null;
+
 function getConfiguredLaneKeys() {
   const lanes = trafficController?.config?.lanes;
   return Array.isArray(lanes) ? lanes : [];
+}
+
+async function resolveIntersectionIdForAnalytics(requestedId) {
+  const trimmed = typeof requestedId === 'string' && requestedId.trim() ? requestedId.trim() : null;
+  if (trimmed && trimmed !== 'default') {
+    return trimmed;
+  }
+
+  if (cachedDefaultIntersectionId) {
+    return cachedDefaultIntersectionId;
+  }
+
+  if (resolvingDefaultIntersectionIdPromise) {
+    try {
+      return await resolvingDefaultIntersectionIdPromise;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  resolvingDefaultIntersectionIdPromise = (async () => {
+    if (DEFAULT_INTERSECTION_ID && DEFAULT_INTERSECTION_ID !== 'default') {
+      cachedDefaultIntersectionId = DEFAULT_INTERSECTION_ID;
+      return cachedDefaultIntersectionId;
+    }
+
+    try {
+      const { data, error, skipped } = await listIntersections({});
+      if (!skipped && !error && Array.isArray(data) && data.length > 0) {
+        const preferred = data.find((item) => item?.status === 'operational') ?? data[0];
+        if (preferred?.id) {
+          cachedDefaultIntersectionId = preferred.id;
+          return cachedDefaultIntersectionId;
+        }
+      }
+
+      if (error && !skipped) {
+        console.warn('[analytics] No se pudo resolver intersección predeterminada (error):', error);
+      }
+    } catch (error) {
+      console.warn('[analytics] No se pudo resolver intersección predeterminada:', error);
+    }
+
+    return null;
+  })();
+
+  try {
+    const resolved = await resolvingDefaultIntersectionIdPromise;
+    return resolved;
+  } finally {
+    resolvingDefaultIntersectionIdPromise = null;
+  }
 }
 
 function ensureLaneEntry(laneKey) {
@@ -60,6 +117,33 @@ function ensureLaneEntry(laneKey) {
     });
   }
   return memoryAnalytics.lanes.get(laneKey);
+}
+
+function syncTransitionBaselineFromDb(counts = []) {
+  if (!Array.isArray(counts)) {
+    return;
+  }
+
+  counts.forEach((row) => {
+    if (!row) {
+      return;
+    }
+    const toState = row.toState ?? row.next_state ?? 'green';
+    if (toState !== 'green') {
+      return;
+    }
+
+    const laneKey = row.laneKey ?? row.lane_key;
+    const count = Number(row.count ?? row.counts ?? row.value);
+    if (!laneKey || !Number.isFinite(count)) {
+      return;
+    }
+
+    const entry = ensureLaneEntry(laneKey);
+    if (entry && entry.greenTransitions < count) {
+      entry.greenTransitions = count;
+    }
+  });
 }
 
 function trimOldPresenceEvents() {
@@ -1074,14 +1158,20 @@ app.get('/api/traffic/lights/:laneId', (req, res) => {
 });
 
 app.get('/api/analytics/overview', async (req, res) => {
-  const intersectionId = req.query.intersectionId ?? DEFAULT_INTERSECTION_ID;
+  const requestedIntersectionId = typeof req.query.intersectionId === 'string' && req.query.intersectionId.trim()
+    ? req.query.intersectionId.trim()
+    : null;
 
   try {
+    const resolvedIntersectionId = await resolveIntersectionIdForAnalytics(requestedIntersectionId);
+    const intersectionIdForQueries = resolvedIntersectionId ?? undefined;
+    const intersectionIdForResponse = resolvedIntersectionId ?? requestedIntersectionId ?? DEFAULT_INTERSECTION_ID;
+
     const [transitionCountsRaw, laneDurationsRaw, presenceSamplesRaw, greenTrendRaw] = await Promise.all([
-      fetchPhaseTransitionCounts({ intersectionId }),
-  fetchLaneDurations({ intersectionId, limit: 5_000 }),
-  fetchPresenceSamples({ intersectionId, limit: 2_000 }),
-  fetchGreenCycleTrend({ intersectionId, limit: 1_000 }),
+      fetchPhaseTransitionCounts({ intersectionId: intersectionIdForQueries }),
+      fetchLaneDurations({ intersectionId: intersectionIdForQueries, limit: 5_000 }),
+      fetchPresenceSamples({ intersectionId: intersectionIdForQueries, limit: 2_000 }),
+      fetchGreenCycleTrend({ intersectionId: intersectionIdForQueries, limit: 1_000 }),
     ]);
 
     const memorySnapshot = getAnalyticsFromMemory();
@@ -1091,6 +1181,7 @@ app.get('/api/analytics/overview', async (req, res) => {
       toState: row.next_state,
       count: Number(row.count) || 0,
     }));
+    syncTransitionBaselineFromDb(transitionCountsDb);
     const transitionCounts = mergeTransitionCounts(transitionCountsDb, memorySnapshot.transitionCounts);
 
     const laneDurationsDb = laneDurationsRaw.map((row) => ({
@@ -1144,7 +1235,7 @@ app.get('/api/analytics/overview', async (req, res) => {
     const greenCycleTrend = mergeGreenTrend(greenCycleTrendDb, memorySnapshot.greenCycleTrend);
 
     res.json({
-      intersectionId,
+      intersectionId: intersectionIdForResponse,
       transitionCounts,
       laneDurations,
       greenShare,

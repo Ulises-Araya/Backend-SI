@@ -130,3 +130,106 @@ on conflict
 (intersection_id, lane_key) do
 update
 set sensor_key = excluded.sensor_key;
+
+insert into public.traffic_presence_events
+    (
+    intersection_id,
+    lane_key,
+    device_id,
+    detected_at,
+    cleared_at,
+    wait_ms,
+    triggered_change
+    )
+values
+    (
+        '3b95cf2f-ad00-41b0-b29e-30131e822139',
+        'north',
+        'esp32-centro',
+        now() - interval '18 minutes',
+        now() - interval '17 minutes 12 seconds',
+        48_000,
+        true
+    ),
+    (
+        '3b95cf2f-ad00-41b0-b29e-30131e822139',
+        'south',
+        'esp32-centro',
+        now() - interval '15 minutes 30 seconds',
+        now() - interval '14 minutes 28 seconds',
+        62_000,
+        true
+    ),
+    (
+        '3b95cf2f-ad00-41b0-b29e-30131e822139',
+        'east',
+        'esp32-centro',
+        now() - interval '13 minutes',
+        now() - interval '12 minutes 5 seconds',
+        55_000,
+        false
+    ),
+    (
+        '3b95cf2f-ad00-41b0-b29e-30131e822139',
+        'west',
+        'esp32-centro',
+        now() - interval '11 minutes 40 seconds',
+        now() - interval '10 minutes 37 seconds',
+        63_000,
+        true
+    ),
+    (
+        'a5c77e67-3a1b-4f9f-8de6-b0e7b2bcf102',
+        'north',
+        'esp32-parque',
+        now() - interval '9 minutes 20 seconds',
+        now() - interval '8 minutes 15 seconds',
+        65_000,
+        true
+    ),
+    (
+        'a5c77e67-3a1b-4f9f-8de6-b0e7b2bcf102',
+        'south',
+        'esp32-parque',
+        now() - interval '8 minutes',
+        now() - interval '7 minutes 6 seconds',
+        54_000,
+        false
+    ),
+    (
+        'a5c77e67-3a1b-4f9f-8de6-b0e7b2bcf102',
+        'east',
+        'esp32-parque',
+        now() - interval '6 minutes 10 seconds',
+        now() - interval '5 minutes 20 seconds',
+        50_000,
+        true
+    ),
+    (
+        'a5c77e67-3a1b-4f9f-8de6-b0e7b2bcf102',
+        'west',
+        'esp32-parque',
+    now() - interval '5 minutes',
+    now() - interval '4 minutes 1 second',
+        59_000,
+        true
+    ),
+    (
+        '4f2cd1b3-9f44-47d6-ac5f-3f3c87b5a944',
+        'north',
+        'esp32-ucr-norte',
+        now() - interval '3 minutes 40 seconds',
+        now() - interval '2 minutes 45 seconds',
+        55_000,
+        false
+    ),
+    (
+        '4f2cd1b3-9f44-47d6-ac5f-3f3c87b5a944',
+        'south',
+        'esp32-ucr-norte',
+    now() - interval '2 minutes 30 seconds',
+    now() - interval '1 minute 21 seconds',
+        69_000,
+        true
+    )
+on conflict do nothing;
