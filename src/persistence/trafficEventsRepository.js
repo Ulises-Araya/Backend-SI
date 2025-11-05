@@ -274,35 +274,6 @@ async function fetchLaneDurations({ intersectionId, limit = 10_000 }) {
 
 async function fetchPresenceSamples({ intersectionId, limit = 2_000 }) {
   const client = getClient();
-
-async function fetchTotalTransitionsCount({ intersectionId } = {}) {
-  const client = getClient();
-  if (!client) {
-    return 0;
-  }
-
-  try {
-    let query = client
-      .from(TABLE_PHASE_CHANGES)
-      .select('id', { count: 'exact', head: true })
-      .eq('next_state', 'green');
-
-    if (intersectionId) {
-      query = query.eq('intersection_id', intersectionId);
-    }
-
-    const { count, error } = await query;
-    if (error) {
-      console.error('[supabase] Error contando transiciones totales:', { intersectionId, error });
-      return 0;
-    }
-
-    return Number(count) || 0;
-  } catch (error) {
-    console.error('[supabase] Error inesperado contando transiciones totales:', { intersectionId, error });
-    return 0;
-  }
-}
   if (!client) {
     return [];
   }
@@ -324,6 +295,34 @@ async function fetchTotalTransitionsCount({ intersectionId } = {}) {
   }
 
   return data ?? [];
+}
+
+async function fetchTotalTransitionsCount({ intersectionId } = {}) {
+  const client = getClient();
+  if (!client) {
+    return 0;
+  }
+
+  try {
+    let query = client
+      .from(TABLE_PHASE_CHANGES)
+      .select('id', { count: 'exact', head: true });
+
+    if (intersectionId) {
+      query = query.eq('intersection_id', intersectionId);
+    }
+
+    const { count, error } = await query;
+    if (error) {
+      console.error('[supabase] Error contando transiciones totales:', { intersectionId, error });
+      return 0;
+    }
+
+    return Number(count) || 0;
+  } catch (error) {
+    console.error('[supabase] Error inesperado contando transiciones totales:', { intersectionId, error });
+    return 0;
+  }
 }
 
 async function fetchGreenCycleTrend({ intersectionId, limit = 1_000 }) {

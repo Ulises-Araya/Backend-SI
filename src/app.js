@@ -433,7 +433,7 @@ async function checkDatabaseConnection() {
       databaseConnected = false;
       return;
     }
-    
+
     // Intentar una consulta simple para verificar conexión
     const { error } = await client.from('traffic_events').select('count').limit(1);
     databaseConnected = !error;
@@ -502,49 +502,49 @@ function buildFallbackIntersectionsResponse(filters = {}) {
 const trafficTickTimer = IS_TEST_ENV
   ? null
   : setInterval(async () => {
-  try {
-    // Verificar conexión a base de datos periódicamente
-    await checkDatabaseConnection();
-    
-  const transitions = trafficController.tick();
-  const phaseChanges = collapsePhaseChanges(transitions);
-    if (phaseChanges.length) {
-      console.debug('[traffic] transitions', phaseChanges);
+    try {
+      // Verificar conexión a base de datos periódicamente
+      await checkDatabaseConnection();
 
-      try {
-        await persistPhaseChanges(
-          phaseChanges.map((change) => ({
+      const transitions = trafficController.tick();
+      const phaseChanges = collapsePhaseChanges(transitions);
+      if (phaseChanges.length) {
+        console.debug('[traffic] transitions', phaseChanges);
+
+        try {
+          await persistPhaseChanges(
+            phaseChanges.map((change) => ({
+              intersectionId: DEFAULT_INTERSECTION_ID,
+              laneKey: change.laneId,
+              previousState: change.previousState,
+              nextState: change.nextState,
+              startedAt: change.startedAt,
+              endedAt: change.endedAt,
+              durationMs: change.durationMs,
+              trigger: change.reason ?? null,
+              deviceId: SYSTEM_DEVICE_ID,
+            })),
+          );
+        } catch (error) {
+          console.error('[supabase] Error guardando cambios de fase en tick:', error);
+        }
+
+        try {
+          await persistTrafficSummary({
+            id: randomUUID(),
             intersectionId: DEFAULT_INTERSECTION_ID,
-            laneKey: change.laneId,
-            previousState: change.previousState,
-            nextState: change.nextState,
-            startedAt: change.startedAt,
-            endedAt: change.endedAt,
-            durationMs: change.durationMs,
-            trigger: change.reason ?? null,
             deviceId: SYSTEM_DEVICE_ID,
-          })),
-        );
-      } catch (error) {
-        console.error('[supabase] Error guardando cambios de fase en tick:', error);
+            stateSnapshot: getTrafficStateWithConnections(),
+            evaluation: phaseChanges,
+            receivedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          console.error('[supabase] Error guardando snapshot de tick:', error);
+        }
       }
-
-      try {
-        await persistTrafficSummary({
-          id: randomUUID(),
-          intersectionId: DEFAULT_INTERSECTION_ID,
-          deviceId: SYSTEM_DEVICE_ID,
-          stateSnapshot: getTrafficStateWithConnections(),
-          evaluation: phaseChanges,
-          receivedAt: new Date().toISOString(),
-        });
-      } catch (error) {
-        console.error('[supabase] Error guardando snapshot de tick:', error);
-      }
+    } catch (error) {
+      console.error('[traffic] Error en ciclo de tick:', error);
     }
-  } catch (error) {
-    console.error('[traffic] Error en ciclo de tick:', error);
-  }
   }, TICK_INTERVAL_MS);
 
 if (trafficTickTimer && typeof trafficTickTimer.unref === 'function') {
@@ -560,6 +560,7 @@ app.use(morgan('dev'));
 const server = http.createServer(app);
 
 const DEFAULT_BATCH_SPREAD_WINDOW_MS = Number(process.env.BATCH_SPREAD_WINDOW_MS ?? 1000);
+const pendingGreenTransitions = new Map();
 
 function broadcast(event, payload) {
   const data = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
@@ -573,7 +574,6 @@ function collapsePhaseChanges(transitions = []) {
     return [];
   }
 
-  const pendingGreen = new Map();
   const collapsed = [];
 
   transitions.forEach((change) => {
@@ -582,15 +582,16 @@ function collapsePhaseChanges(transitions = []) {
     }
 
     if (change.previousState === 'green' && change.nextState === 'yellow') {
-      pendingGreen.set(change.laneId, change);
+      pendingGreenTransitions.set(change.laneId, change);
       return;
     }
 
     if (change.previousState === 'yellow' && change.nextState === 'red') {
-      const queued = pendingGreen.get(change.laneId);
+      const queued = pendingGreenTransitions.get(change.laneId);
       if (queued) {
         const startedAt = queued.startedAt;
         const endedAt = change.endedAt;
+        const reason = queued.reason ?? change.reason ?? null;
         collapsed.push({
           type: 'phase-change',
           laneId: change.laneId,
@@ -599,11 +600,12 @@ function collapsePhaseChanges(transitions = []) {
           startedAt,
           endedAt,
           durationMs: Math.max(0, endedAt - startedAt),
-          reason: queued.reason ?? change.reason ?? null,
+          reason,
         });
-        pendingGreen.delete(change.laneId);
+        pendingGreenTransitions.delete(change.laneId);
         return;
       }
+
       collapsed.push({
         ...change,
         previousState: 'green',
@@ -612,10 +614,14 @@ function collapsePhaseChanges(transitions = []) {
       return;
     }
 
-    if (
-      (change.previousState === 'red' && change.nextState === 'green') ||
-      (change.previousState === 'green' && change.nextState === 'red')
-    ) {
+    if (change.previousState === 'red' && change.nextState === 'green') {
+      pendingGreenTransitions.delete(change.laneId);
+      collapsed.push(change);
+      return;
+    }
+
+    if (change.previousState === 'green' && change.nextState === 'red') {
+      pendingGreenTransitions.delete(change.laneId);
       collapsed.push(change);
     }
   });
@@ -666,7 +672,7 @@ async function processTrafficEvent(payload = {}, context = {}) {
     const persistenceResult = await persistTrafficEvent({
       id: eventId,
       deviceId,
-    intersectionId: normalizedIntersectionId,
+      intersectionId: normalizedIntersectionId,
       sensors,
       stateSnapshot: result.state,
       evaluation: result.evaluation,
@@ -732,9 +738,9 @@ async function processTrafficEvent(payload = {}, context = {}) {
     receivedAt,
     state: result.state,
     evaluation: result.evaluation,
-  intersectionId: normalizedIntersectionId,
-  presenceEvents,
-  phaseChanges,
+    intersectionId: normalizedIntersectionId,
+    presenceEvents,
+    phaseChanges,
     persistence,
     phasePersistence,
     presencePersistence,
